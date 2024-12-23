@@ -41,6 +41,7 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             terminate_at_goal=True,
             ob_type='states',
             add_noise_to_goal=True,
+            modify_floor_tex=None,
             *args,
             **kwargs,
         ):
@@ -53,6 +54,7 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                 terminate_at_goal: Whether to terminate the episode when the goal is reached.
                 ob_type: Observation type. Either 'states' or 'pixels'.
                 add_noise_to_goal: Whether to add noise to the goal position.
+                modify_floor_tex: Function that accpets args (tex_rgb, maze_map) to modify tex_rbg pixel-wise.
                 *args: Additional arguments to pass to the parent locomotion environment.
                 **kwargs: Additional keyword arguments to pass to the parent locomotion environment.
             """
@@ -177,13 +179,16 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                 attr_name = 'tex_rgb' if hasattr(self.model, 'tex_rgb') else 'tex_data'
                 tex_rgb = getattr(self.model, attr_name)[tex_grid.adr[0] : tex_grid.adr[0] + 3 * tex_height * tex_width]
                 tex_rgb = tex_rgb.reshape(tex_height, tex_width, 3)
-                for x in range(tex_height):
-                    for y in range(tex_width):
-                        min_value = 0
-                        max_value = 192
-                        r = int(x / tex_height * (max_value - min_value) + min_value)
-                        g = int(y / tex_width * (max_value - min_value) + min_value)
-                        tex_rgb[x, y, :] = [r, g, 128]
+                if modify_floor_tex:
+                    modify_floor_tex(tex_rgb, self.maze_map)
+                else:
+                    for x in range(tex_height):
+                        for y in range(tex_width):
+                            min_value = 0
+                            max_value = 192
+                            r = int(x / tex_height * (max_value - min_value) + min_value)
+                            g = int(y / tex_width * (max_value - min_value) + min_value)
+                            tex_rgb[x, y, :] = [r, g, 128]
             else:
                 ex_ob = self.get_ob()
                 self.observation_space = Box(low=-np.inf, high=np.inf, shape=ex_ob.shape, dtype=ex_ob.dtype)
