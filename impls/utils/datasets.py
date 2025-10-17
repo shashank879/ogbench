@@ -395,3 +395,59 @@ class HGCDataset(GCDataset):
                 )
 
         return batch
+
+
+class DHPDataset(HGCDataset):
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        samples = super().sample(batch_size, idxs, evaluation)
+
+        # Prepare to sample 'coarse_transitions'
+        subgoal_steps = self.config['subgoal_steps']
+        coarse_transitions = []
+        obs = self.dataset['observations']
+        frame_stack = self.config.get('frame_stack', None)
+
+        # Precompute trajectory boundaries
+        initial_locs = self.initial_locs
+        terminal_locs = self.terminal_locs
+
+        n_traj = len(initial_locs)
+        obs_shape = obs.shape[1:]
+
+        # Helper to get stacked obs if needed
+        def get_obs(idx):
+            if frame_stack is not None:
+                return self.get_observations(np.array([idx]))[0]
+            else:
+                return obs[idx]
+
+        count = 0
+        while count < batch_size:
+            # Sample a trajectory
+            traj_idx = np.random.randint(n_traj)
+            traj_start = initial_locs[traj_idx]
+            traj_end = terminal_locs[traj_idx]
+            traj_len = traj_end - traj_start + 1
+
+            # Check if trajectory is long enough
+            if traj_len <= subgoal_steps:
+                print(f'Skipping short trajectory of length {traj_len}')
+                continue
+
+            # Sample initial index
+            i = np.random.randint(traj_start, traj_end - subgoal_steps + 1)
+            # Sample final index
+            f = np.random.randint(i + subgoal_steps, traj_end + 1)
+            # Midway index
+            m = int(round((i + f) / 2))
+
+            # Collect observations
+            initial_obs = get_obs(i)
+            midway_obs = get_obs(m)
+            final_obs = get_obs(f)
+            coarse_transitions.append(np.stack([initial_obs, midway_obs, final_obs], axis=0))
+            count += 1
+
+        samples['coarse_transitions'] = np.stack(coarse_transitions, axis=0)
+        return samples
