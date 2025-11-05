@@ -5,6 +5,7 @@ from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
 from agents.qrl import QRLAgent
 from agents.sac import SACAgent
+from agents.dhp_1value import DHPv1Agent
 
 agents = dict(
     crl=CRLAgent,
@@ -14,4 +15,5 @@ agents = dict(
     hiql=HIQLAgent,
     qrl=QRLAgent,
     sac=SACAgent,
+    dhpv1=DHPv1Agent,
 )
