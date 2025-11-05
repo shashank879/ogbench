@@ -21,6 +21,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
+flags.DEFINE_string('exp_name', None, 'Experiment name.')
 flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
@@ -45,7 +46,7 @@ config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
 def main(_):
     # Set up logger.
-    exp_name = get_exp_name(FLAGS.seed)
+    exp_name = FLAGS.exp_name or get_exp_name(FLAGS.seed)
     if not FLAGS.debug:
         setup_wandb(project='OGBench', group=FLAGS.run_group, name=exp_name)
 
@@ -153,7 +154,7 @@ def main(_):
             if FLAGS.video_episodes > 0:
                 if not FLAGS.debug:
                     video = get_wandb_video(renders=renders, n_cols=num_tasks)
-                eval_metrics['video'] = video
+                    eval_metrics['video'] = video
 
             if not FLAGS.debug:
                 wandb.log(eval_metrics, step=i)
