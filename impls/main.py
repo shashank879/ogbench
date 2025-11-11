@@ -2,6 +2,7 @@ import json
 import os
 import random
 import time
+import shutil
 from collections import defaultdict
 
 import jax
@@ -13,9 +14,11 @@ from agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset, DHPDataset
 from utils.env_utils import make_env_and_datasets
+from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
+from PIL import Image
 
 FLAGS = flags.FLAGS
 
@@ -103,7 +106,7 @@ def main(_):
         agent, update_info = agent.update(batch)
 
         # Log metrics.
-        if i % FLAGS.log_interval == 0:
+        if i==1 or i % FLAGS.log_interval == 0:
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
@@ -112,6 +115,23 @@ def main(_):
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
             last_time = time.time()
+
+            if hasattr(agent, 'goal_buffer'):
+                # Add rendered goal positions as summary
+                buffer_frame = visualize_goal_buffer_on_maze(
+                    goal_buffer=agent.goal_buffer,
+                    env=env,
+                    render_size=1024,
+                    goal_color=(0, 255, 0),  # Green
+                    goal_radius=1,
+                )
+                train_metrics['goal_buffer/visualization'] = wandb.Image(buffer_frame)
+
+                # Save to disk for debugging
+                viz_dir = os.path.join(FLAGS.save_dir, 'goal_buffer')
+                os.makedirs(viz_dir, exist_ok=True)
+                Image.fromarray(buffer_frame).save(os.path.join(viz_dir, f'step_{i}.png'))
+
             if not FLAGS.debug:
                 wandb.log(train_metrics, step=i)
             train_logger.log(train_metrics, step=i)
@@ -125,11 +145,12 @@ def main(_):
             renders = []
             eval_metrics = {}
             overall_metrics = defaultdict(list)
+            render_trajs = []
             task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
             num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
             for task_id in tqdm.trange(1, num_tasks + 1):
                 task_name = task_infos[task_id - 1]['task_name']
-                eval_info, trajs, cur_renders = evaluate(
+                eval_info, trajs, cur_renders, cur_render_trajs = evaluate(
                     agent=eval_agent,
                     env=env,
                     task_id=task_id,
@@ -141,6 +162,7 @@ def main(_):
                     eval_gaussian=FLAGS.eval_gaussian,
                 )
                 renders.extend(cur_renders)
+                render_trajs.extend(cur_render_trajs)
                 metric_names = ['success']
                 eval_metrics.update(
                     {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
@@ -155,6 +177,21 @@ def main(_):
                 if not FLAGS.debug:
                     video = get_wandb_video(renders=renders, n_cols=num_tasks)
                     eval_metrics['video'] = video
+
+                # Goal visualization video
+                if hasattr(agent, 'goal_buffer') and len(render_trajs) > 0 and 'retrieved_goal' in render_trajs[0]:
+                    goal_video: wandb.Video = create_goal_trajectory_video(
+                        render_trajs,
+                        env,
+                        renders=renders,
+                        render_size=512,
+                        n_cols=num_tasks
+                    )
+                    goal_viz_dir = os.path.join(FLAGS.save_dir, 'goal_video')
+                    os.makedirs(goal_viz_dir, exist_ok=True)
+                    shutil.copy(goal_video._path, os.path.join(goal_viz_dir, f'step_{i}.mp4'))
+                    if goal_video is not None:
+                        eval_metrics['goal_buffer/trajectory_video'] = goal_video
 
             if not FLAGS.debug:
                 wandb.log(eval_metrics, step=i)

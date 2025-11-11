@@ -66,6 +66,7 @@ def evaluate(
     stats = defaultdict(list)
 
     renders = []
+    render_trajs = []
     for i in trange(num_eval_episodes + num_video_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
@@ -78,6 +79,9 @@ def evaluate(
         render = []
         while not done:
             action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
+            action_info = None
+            if isinstance(action, tuple):
+                action, action_info = action
             action = np.array(action)
             if not config.get('discrete'):
                 if eval_gaussian is not None:
@@ -103,15 +107,23 @@ def evaluate(
                 done=done,
                 info=info,
             )
-            add_to(traj, transition)
+            if action_info:
+                transition.update(action_info)
+
+            if should_render:
+                if (step % video_frame_skip == 0 or done):
+                    add_to(traj, transition)
+            else:
+                add_to(traj, transition)
             observation = next_observation
         if i < num_eval_episodes:
             add_to(stats, flatten(info))
             trajs.append(traj)
         else:
             renders.append(np.array(render))
+            render_trajs.append({k:np.array(v) for k,v in traj.items()})
 
     for k, v in stats.items():
         stats[k] = np.mean(v)
 
-    return stats, trajs, renders
+    return stats, trajs, renders, render_trajs
