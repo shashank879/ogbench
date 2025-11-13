@@ -399,55 +399,168 @@ class HGCDataset(GCDataset):
 
 class DHPDataset(HGCDataset):
 
-    def sample(self, batch_size, idxs=None, evaluation=False):
-        samples = super().sample(batch_size, idxs, evaluation)
+    def sample_low_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, max_distance=None):
+        """Sample goals for the given indices."""
+        batch_size = len(idxs)
 
-        # Prepare to sample 'coarse_transitions'
-        subgoal_steps = self.config['subgoal_steps']
-        coarse_transitions = []
-        obs = self.dataset['observations']
-        frame_stack = self.config.get('frame_stack', None)
+        # Random goals.
+        random_goal_idxs = self.dataset.get_random_idxs(batch_size)
 
-        # Precompute trajectory boundaries
-        initial_locs = self.initial_locs
-        terminal_locs = self.terminal_locs
+        # Goals from the same trajectory (excluding the current state, unless it is the final state).
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        if max_distance:
+            final_state_idxs = np.minimum(idxs + max_distance, final_state_idxs)
+        if geom_sample:
+            # Geometric sampling.
+            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
+            middle_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+        else:
+            # Uniform sampling.
+            distances = np.random.rand(batch_size)  # in [0, 1)
+            middle_goal_idxs = np.round(
+                (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+            ).astype(int)
+        goal_idxs = np.where(
+            np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal + 1e-6), middle_goal_idxs, random_goal_idxs
+        )
 
-        n_traj = len(initial_locs)
-        obs_shape = obs.shape[1:]
+        # Goals at the current state.
+        goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
 
-        # Helper to get stacked obs if needed
-        def get_obs(idx):
-            if frame_stack is not None:
-                return self.get_observations(np.array([idx]))[0]
-            else:
-                return obs[idx]
+        return goal_idxs
 
-        count = 0
-        while count < batch_size:
-            # Sample a trajectory
-            traj_idx = np.random.randint(n_traj)
-            traj_start = initial_locs[traj_idx]
-            traj_end = terminal_locs[traj_idx]
-            traj_len = traj_end - traj_start + 1
+    def sample_high_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, normal_subgoal_sample):
+        batch_size = len(idxs)
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        distances = np.random.rand(batch_size)  # in [0, 1)
+        value_goal_idxs = np.round(
+            (np.minimum(idxs + self.config['subgoal_steps'] + 1, final_state_idxs) * distances +
+            final_state_idxs * (1 - distances))
+        ).astype(int)
 
-            # Check if trajectory is long enough
-            if traj_len <= subgoal_steps:
-                print(f'Skipping short trajectory of length {traj_len}')
-                continue
+        if normal_subgoal_sample:
+            subgoal_distances = np.clip(np.random.normal(0.25, 0.25, batch_size), 0, 1)
+        else:
+            subgoal_distances = np.random.rand(batch_size)  # in [0, 1)
 
-            # Sample initial index
-            i = np.random.randint(traj_start, traj_end - subgoal_steps + 1)
-            # Sample final index
-            f = np.random.randint(i + subgoal_steps, traj_end + 1)
-            # Midway index
-            m = int(round((i + f) / 2))
+        value_subgoal_idxs = np.round(
+            (np.minimum(idxs, value_goal_idxs) * subgoal_distances + value_goal_idxs * (1 - subgoal_distances))
+        ).astype(int)
 
-            # Collect observations
-            initial_obs = get_obs(i)
-            midway_obs = get_obs(m)
-            final_obs = get_obs(f)
-            coarse_transitions.append(np.stack([initial_obs, midway_obs, final_obs], axis=0))
-            count += 1
+        pick_random = np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal + 1e-6)
+        value_goal_idxs = np.where(pick_random, value_goal_idxs, self.dataset.get_random_idxs(batch_size))
+        value_subgoal_idxs = np.where(pick_random, value_subgoal_idxs, self.dataset.get_random_idxs(batch_size))
 
-        samples['coarse_transitions'] = np.stack(coarse_transitions, axis=0)
-        return samples
+        value_goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, value_goal_idxs)
+        value_subgoal_idxs = np.where((value_goal_idxs == idxs) * (np.random.rand(batch_size) < .7), idxs, value_subgoal_idxs)
+
+        return value_goal_idxs, value_subgoal_idxs
+
+    def sample(self, batch_size: int, idxs=None, evaluation=False):
+        """Sample a batch of transitions with goals.
+
+        This method samples a batch of transitions with goals from the dataset. The goals are stored in the keys
+        'value_goals', 'low_actor_goals', 'high_actor_goals', and 'high_actor_targets'. It also computes the 'rewards'
+        and 'masks' based on the indices of the goals.
+
+        Args:
+            batch_size: Batch size.
+            idxs: Indices of the transitions to sample. If None, random indices are sampled.
+            evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
+        """
+        if idxs is None:
+            idxs = self.dataset.get_random_idxs(batch_size)
+
+        batch = self.dataset.sample(batch_size, idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(idxs)
+            batch['next_observations'] = self.get_observations(idxs + 1)
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+
+        # Sample low value goals.
+        low_value_goal_idxs = self.sample_low_goals(
+            idxs,
+            self.config['value_p_curgoal'],
+            self.config['value_p_trajgoal'],
+            self.config['value_p_randomgoal'],
+            self.config['value_geom_sample'],
+            self.config.get('value_max_dist', None),
+        )
+        batch['low_value_goals'] = self.get_observations(low_value_goal_idxs)
+
+        low_successes = (idxs == low_value_goal_idxs).astype(float)
+        batch['low_masks'] = 1.0 - low_successes
+        batch['low_rewards'] = low_successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        # Sample high value goals.
+        value_goal_idxs, value_subgoal_idxs = self.sample_high_goals(
+            idxs,
+            self.config['high_value_p_curgoal'],
+            self.config['high_value_p_trajgoal'],
+            self.config['high_value_p_randomgoal'],
+            self.config['high_value_normal_subg_sample'],
+        )
+
+        batch['high_value_goals'] = self.get_observations(value_goal_idxs)
+        batch['high_value_subgoals'] = self.get_observations(value_subgoal_idxs)
+
+        successes_left = (np.abs(idxs - value_subgoal_idxs) < self.config['subgoal_steps']).astype(float)
+        successes_right = (np.abs(value_subgoal_idxs - value_goal_idxs) < self.config['subgoal_steps']).astype(float)
+        batch['masks_left'] = 1.0 - successes_left
+        batch['masks_right'] = 1.0 - successes_right
+        batch['rewards_left'] = successes_left - (1.0 if self.config['gc_negative'] else 0.0)
+        batch['rewards_right'] = successes_right - (1.0 if self.config['gc_negative'] else 0.0)
+
+        # Set low-level actor goals.
+        low_goal_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
+        batch['low_actor_goals'] = self.get_observations(low_goal_idxs)
+
+        # Sample high-level actor goals and set prediction targets.
+        # High-level future goals.
+        if self.config['actor_geom_sample']:
+            # Geometric sampling.
+            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
+            high_traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+        else:
+            # Uniform sampling.
+            distances = np.random.rand(batch_size)  # in [0, 1)
+            high_traj_goal_idxs = np.round(
+                (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+            ).astype(int)
+        high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
+        # high_traj_target_idxs = np.minimum(
+        #     (idxs + high_traj_goal_idxs) // 2,
+        #     high_traj_goal_idxs)
+
+        # High-level random goals.
+        high_random_goal_idxs = self.dataset.get_random_idxs(batch_size)
+        high_random_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
+        # high_random_target_idxs = np.minimum(
+        #     (idxs + high_traj_goal_idxs) // 2,
+        #     final_state_idxs)
+
+        # Pick between high-level future goals and random goals.
+        pick_random = np.random.rand(batch_size) < self.config['actor_p_randomgoal']
+        high_goal_idxs = np.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
+        high_target_idxs = np.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
+
+        batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
+        batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(
+                    batch,
+                    [
+                        'observations',
+                        'next_observations',
+                        'low_value_goals',
+                        'high_value_goals',
+                        'high_value_subgoals',
+                        'low_actor_goals',
+                        'high_actor_goals',
+                        'high_actor_targets',
+                    ],
+                )
+
+        return batch
