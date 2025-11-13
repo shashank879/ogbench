@@ -104,17 +104,23 @@ def main(_):
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
         agent, update_info = agent.update(batch)
+        if hasattr(agent, 'non_jit_update'):
+            non_jit_update_info = agent.non_jit_update(batch, i)
+            update_info.update(non_jit_update_info)
 
         # Log metrics.
         if i==1 or i % FLAGS.log_interval == 0:
-            train_metrics = {f'training/{k}': v for k, v in update_info.items()}
-            if val_dataset is not None:
-                val_batch = val_dataset.sample(config['batch_size'])
-                _, val_info = agent.total_loss(val_batch, grad_params=None)
-                train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
-            train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
-            train_metrics['time/total_time'] = time.time() - first_time
-            last_time = time.time()
+            if i > 1:
+                train_metrics = {f'training/{k}': v for k, v in update_info.items()}
+                if val_dataset is not None:
+                    val_batch = val_dataset.sample(config['batch_size'])
+                    _, val_info = agent.total_loss(val_batch, grad_params=None)
+                    train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
+                train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
+                train_metrics['time/total_time'] = time.time() - first_time
+                last_time = time.time()
+            else:
+                train_metrics = {}
 
             if hasattr(agent, 'goal_buffer'):
                 # Add rendered goal positions as summary
@@ -125,7 +131,7 @@ def main(_):
                     goal_color=(0, 255, 0),  # Green
                     goal_radius=1,
                 )
-                train_metrics['goal_buffer/visualization'] = wandb.Image(buffer_frame)
+                train_metrics['buffer_goals'] = wandb.Image(buffer_frame)
 
                 # Save to disk for debugging
                 viz_dir = os.path.join(FLAGS.save_dir, 'goal_buffer')
@@ -175,23 +181,23 @@ def main(_):
 
             if FLAGS.video_episodes > 0:
                 if not FLAGS.debug:
-                    video = get_wandb_video(renders=renders, n_cols=num_tasks)
+                    video = get_wandb_video(renders=renders.copy(), n_cols=num_tasks)
                     eval_metrics['video'] = video
 
                 # Goal visualization video
-                if hasattr(agent, 'goal_buffer') and len(render_trajs) > 0 and 'retrieved_goal' in render_trajs[0]:
+                if hasattr(agent, 'goal_buffer') and len(render_trajs) > 0 and 'subgoals' in render_trajs[0]:
                     goal_video: wandb.Video = create_goal_trajectory_video(
                         render_trajs,
                         env,
                         renders=renders,
-                        render_size=512,
-                        n_cols=num_tasks
+                        n_cols=num_tasks,
+                        goal_buffer=agent.goal_buffer,
                     )
                     goal_viz_dir = os.path.join(FLAGS.save_dir, 'goal_video')
                     os.makedirs(goal_viz_dir, exist_ok=True)
                     shutil.copy(goal_video._path, os.path.join(goal_viz_dir, f'step_{i}.mp4'))
                     if goal_video is not None:
-                        eval_metrics['goal_buffer/trajectory_video'] = goal_video
+                        eval_metrics['subgoals_video'] = goal_video
 
             if not FLAGS.debug:
                 wandb.log(eval_metrics, step=i)
