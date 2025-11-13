@@ -106,6 +106,8 @@ def evaluate(
                 reward=reward,
                 done=done,
                 info=info,
+                goal=goal,
+                goal_frame=goal_frame,
             )
             if action_info:
                 transition.update(action_info)

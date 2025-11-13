@@ -116,7 +116,8 @@ def visualize_goals_on_trajectory(
     decoded_goal_color=(255, 0, 0),  # Red for decoded/predicted goals
     retrieved_goal_color=(0, 0, 255),  # Blue for retrieved goals
     final_goal_color=(255, 255, 0),  # Yellow for final goal
-    goal_radius=4,
+    goal_radius=2,
+    goal_buffer=None,
 ):
     """Visualize predicted and retrieved goals on trajectory renders.
 
@@ -145,12 +146,12 @@ def visualize_goals_on_trajectory(
     for traj, render in zip(trajectories, renders):
         if renders:
             frame_size = render.shape[2]
-            assert render.shape[1] in [frame_size, 2*frame_size], f'Frame height ={render.shape[1]} must in [{frame_size},{2*frame_size}]'
+            assert render.shape[1] in [frame_size, 2*frame_size], f'Frame height in shape ({render.shape}) must in [{frame_size},{2*frame_size}]'
         else:
             frame_size = render_size
         assert len(traj['observation']) == len(render), 'Length mismatch'
         # Get final goal from trajectory info
-        final_goal_obs = traj['info'][-1].get('goal')
+        final_goal_obs = traj['goal'][-1]
         if final_goal_obs is not None:
             final_goal_xy = np.array(final_goal_obs)[:2]
         else:
@@ -160,37 +161,76 @@ def visualize_goals_on_trajectory(
         for step_idx in range(len(traj['observation'])):
             # Render the environment at this state
             obs = traj['observation'][step_idx]
+            subgoal_first_reach_index = traj['subgoal_first_reach_index'][step_idx] if 'subgoal_first_reach_index' in traj else -1
 
             # Set the environment to this state and render
             # For antmaze, the first 2 dims are xy position
             agent_xy = obs[:2]
             if renders:
-                frame = render[min(step_idx, len(render) - 1)]
+                render_frame = render[min(step_idx, len(render) - 1)]
             else:
                 env.unwrapped.set_xy(agent_xy) if hasattr(env, 'unwrapped') else env.set_xy(agent_xy)
-                frame = env.render().copy()
+                render_frame = env.render().copy()
+            frame = np.zeros((frame_size, frame_size, 3), dtype=np.uint8) + 255
+
+            if goal_buffer:
+                # Extract xy coordinates from all goal observations
+                # Assuming goal_observations have xy in first 2 dimensions
+                goal_xys = []
+                for goal_obs in goal_buffer.goal_observations:
+                    # Convert from JAX array to numpy if needed
+                    goal_obs_np = np.array(goal_obs)
+                    goal_xys.append(goal_obs_np[:2])
+                goal_xys = np.array(goal_xys)  # Shape: (num_goals, 2)
+
+                # Convert xy coordinates to pixel coordinates
+                goal_pixels = xy_to_pixel_coords(
+                    goal_xys, 
+                    maze_map=maze_map,
+                    maze_type=maze_type,
+                    render_size=frame_size  # Assuming square render
+                )
+
+                # Draw goals on the frame
+                for pixel_x, pixel_y in goal_pixels:
+                    if frame.shape[0] == 2*frame_size:
+                        pixel_y += frame_size
+                    # Ensure coordinates are within bounds
+                    if 0 <= pixel_x < frame.shape[1] and 0 <= pixel_y < frame.shape[0]:
+                        cv2.circle(
+                            frame, 
+                            (int(pixel_x), int(pixel_y)), 
+                            1, 
+                            (0, 255, 0), 
+                            -1  # Filled circle
+                        )
 
             # Convert goals to pixel coordinates
             goals_to_draw = []
 
             # Add decoded goal (predicted subgoal)
-            if 'decoded_goal' in traj and step_idx < len(traj['decoded_goal']):
-                decoded_goal = traj['decoded_goal'][step_idx]
-                if decoded_goal is not None:
-                    assert len(traj['observation'][0].shape) == 1, 'Cannot plot Images'
+            if 'decoded_subgoals' in traj and step_idx < len(traj['decoded_subgoals']):
+                decoded_subgoals = traj['decoded_subgoals'][step_idx]
+                if subgoal_first_reach_index > -1:
+                    decoded_subgoals = decoded_subgoals[:subgoal_first_reach_index+1]
+                assert len(traj['observation'][0].shape) == 1, 'Cannot plot Images'
+                for decoded_goal in decoded_subgoals:
                     decoded_goal_xy = np.array(decoded_goal)[:2]
-                    goals_to_draw.append((decoded_goal_xy, decoded_goal_color, 'retrieved'))
+                    goals_to_draw.append((decoded_goal_xy, decoded_goal_color, 'decoded'))
 
             # Add retrieved goal (from buffer)
-            if 'retrieved_goal' in traj and step_idx < len(traj['retrieved_goal']):
-                retrieved_goal_obs = traj['retrieved_goal'][step_idx]
-                if retrieved_goal_obs is not None:
-                    retrieved_goal_xy = np.array(retrieved_goal_obs)[:2]
+            if 'subgoals' in traj and step_idx < len(traj['subgoals']):
+                retrieved_subgoals = traj['subgoals'][step_idx]
+                if subgoal_first_reach_index > -1:
+                    retrieved_subgoals = retrieved_subgoals[:subgoal_first_reach_index+1]
+                for retrieved_subgoal in retrieved_subgoals:
+                    retrieved_goal_xy = np.array(retrieved_subgoal)[:2]
                     goals_to_draw.append((retrieved_goal_xy, retrieved_goal_color, 'retrieved'))
 
             # Add final target goal
             if final_goal_xy is not None:
                 goals_to_draw.append((final_goal_xy, final_goal_color, 'target'))
+            goals_to_draw.append((agent_xy, (0, 0, 0), 'agent'))
 
             # Draw goals on frame
             if len(goals_to_draw) > 0:
@@ -214,7 +254,7 @@ def visualize_goals_on_trajectory(
                             -1
                         )
 
-            traj_frames.append(frame)
+            traj_frames.append(np.concatenate([render_frame, frame], 0))
 
         all_frames.append(np.array(traj_frames))
 
@@ -226,7 +266,8 @@ def create_goal_trajectory_video(
     env,
     renders=None,
     render_size=400,
-    n_cols=None
+    n_cols=None,
+    goal_buffer=None
 ):
     """Create a video grid showing goal visualizations across trajectories.
 
@@ -241,7 +282,7 @@ def create_goal_trajectory_video(
     """
     # Generate frames with goal visualizations
     trajectory_frames = visualize_goals_on_trajectory(
-        trajectories, env, renders=renders, render_size=render_size
+        trajectories, env, renders=renders, render_size=render_size, goal_buffer=goal_buffer
     )
 
     # Use the same grid layout as the main video
