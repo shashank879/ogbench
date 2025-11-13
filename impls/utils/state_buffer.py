@@ -24,8 +24,10 @@ class GoalBuffer:
         """
         assert len([x for x in [state_encoder, goal_rep_fn, value_fn] if x is not None]), 'Only one should be specified [state_encoder, goal_rep_fn, value_fn]'
         if state_encoder:
+            self.reencode_all(state_encoder=state_encoder)
             goal_embeddings = jax.vmap(state_encoder)(goal_observations)
         elif goal_rep_fn:
+            self.reencode_all(goal_rep_fn=goal_rep_fn)
             if self.reference_state is None:
                 # Fallback: use zeros as reference
                 self.reference_state = jnp.zeros_like(goal_observations[0])
