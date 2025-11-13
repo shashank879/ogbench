@@ -132,42 +132,42 @@ class GoalBuffer:
 
     def _compute_pairwise_chunked(self, observations, value_fn, chunk_size=128):
         """Compute pairwise value-based distances in chunks to avoid OOM.
-        
+
         Args:
             observations: Array of shape (n, obs_dim)
             value_fn: Function that takes (s, g) and returns negative value
             chunk_size: Number of pairs to process at once
-            
+
         Returns:
             Pairwise distances array of shape (n, n)
         """
         n = len(observations)
         pairwise_distances = jnp.zeros((n, n))
-        
+
         # Process in chunks of rows
         for i in range(0, n, chunk_size):
             end_i = min(i + chunk_size, n)
             chunk_obs_i = observations[i:end_i]
-            
+
             # For each chunk of i, compute distances to all j
             chunk_distances = []
             for j in range(0, n, chunk_size):
                 end_j = min(j + chunk_size, n)
                 chunk_obs_j = observations[j:end_j]
-                
+
                 # Compute (chunk_i_size, chunk_j_size) distance matrix
                 # Expand dimensions for broadcasting
                 s_expanded = jnp.tile(chunk_obs_i[:, None, :], (1, len(chunk_obs_j), 1))
                 g_expanded = jnp.tile(chunk_obs_j[None, :, :], (len(chunk_obs_i), 1, 1))
-                
+
                 # value_fn should be vectorized to handle batched inputs
                 chunk_dist = value_fn(s_expanded, g_expanded)
                 chunk_distances.append(chunk_dist)
-            
+
             # Concatenate chunks for this row range
             row_distances = jnp.concatenate(chunk_distances, axis=1)
             pairwise_distances = pairwise_distances.at[i:end_i, :].set(row_distances)
-        
+
         return pairwise_distances
 
     def retrieve_nearest_embedding(self, goal_emb_query=None, goal_rep_query=None, current_state=None, goal_rep_fn=None):
@@ -226,7 +226,7 @@ class GoalBuffer:
             # Re-compute embeddings: phi([s_ref; g])
             if self.reference_state is None:
                 self.reference_state = jnp.zeros_like(observations_array[0])
-            
+
             ref_repeated = jnp.tile(self.reference_state[None, :], (len(observations_array), 1))
             new_embeddings = jax.vmap(goal_rep_fn)(ref_repeated, observations_array)
         else:
@@ -247,24 +247,24 @@ class GoalBuffer:
         """Get diagnostic metrics about buffer state."""
         if len(self.goal_embeddings) == 0:
             return {}
-        
+
         embeddings_array = jnp.stack(self.goal_embeddings)
-        
+
         # Pairwise distances
         diff = embeddings_array[:, None, :] - embeddings_array[None, :, :]
         pairwise_distances = jnp.linalg.norm(diff, axis=-1)
-        
+
         # Mask diagonal
         mask = 1 - jnp.eye(len(embeddings_array))
         masked_distances = pairwise_distances + (1 - mask) * 1e10
-        
+
         # Nearest neighbor distances
         nn_distances = masked_distances.min(axis=1)
-        
+
         # Centroid and coverage
         centroid = embeddings_array.mean(axis=0)
         radii = jnp.linalg.norm(embeddings_array - centroid, axis=1)
-        
+
         return {
             'size': len(self.goal_embeddings),
             'utilization': len(self.goal_embeddings) / self.capacity,
