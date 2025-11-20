@@ -230,6 +230,9 @@ def visualize_goals_on_trajectory(
     final_goal_color=(255, 255, 0),  # Yellow for final goal
     goal_radius=2,
     goal_buffer=None,
+    show_indices=True,  # New parameter to control index display
+    font_scale=0.4,  # Size of the index text
+    font_thickness=1,  # Thickness of the index text
 ):
     """Visualize predicted and retrieved goals on trajectory renders.
 
@@ -246,7 +249,9 @@ def visualize_goals_on_trajectory(
         retrieved_goal_color: RGB color for retrieved goals
         final_goal_color: RGB color for final target goal
         goal_radius: Radius of goal markers in pixels
-
+        show_indices: Whether to show index numbers next to goals
+        font_scale: Size of index text
+        font_thickness: Thickness of index text
     Returns:
         List of frame arrays with goal visualizations
     """
@@ -326,24 +331,23 @@ def visualize_goals_on_trajectory(
                 if subgoal_first_reach_index > -1:
                     decoded_subgoals = decoded_subgoals[:subgoal_first_reach_index+1]
                 assert len(traj['observation'][0].shape) == 1, 'Cannot plot Images'
-                for decoded_goal in decoded_subgoals:
+                for idx, decoded_goal in enumerate(decoded_subgoals):
                     decoded_goal_xy = np.array(decoded_goal)[:2]
-                    goals_to_draw.append((decoded_goal_xy, decoded_goal_color, 'decoded'))
+                    goals_to_draw.append((decoded_goal_xy, decoded_goal_color, 'decoded', idx))
 
             # Add retrieved goal (from buffer)
             if 'subgoals' in traj and step_idx < len(traj['subgoals']):
                 retrieved_subgoals = traj['subgoals'][step_idx]
                 if subgoal_first_reach_index > -1:
                     retrieved_subgoals = retrieved_subgoals[:subgoal_first_reach_index+1]
-                for retrieved_subgoal in retrieved_subgoals:
+                for idx, retrieved_subgoal in enumerate(retrieved_subgoals):
                     retrieved_goal_xy = np.array(retrieved_subgoal)[:2]
-                    goals_to_draw.append((retrieved_goal_xy, retrieved_goal_color, 'retrieved'))
+                    goals_to_draw.append((retrieved_goal_xy, retrieved_goal_color, 'retrieved', idx))
 
             # Add final target goal
             if final_goal_xy is not None:
-                goals_to_draw.append((final_goal_xy, final_goal_color, 'target'))
-            goals_to_draw.append((agent_xy, (0, 0, 0), 'agent'))
-
+                goals_to_draw.append((final_goal_xy, final_goal_color, 'target', None))
+            goals_to_draw.append((agent_xy, (0, 0, 0), 'agent', None))
             # Draw goals on frame
             if len(goals_to_draw) > 0:
                 goal_xys = np.array([g[0] for g in goals_to_draw])
@@ -353,19 +357,50 @@ def visualize_goals_on_trajectory(
                     maze_type=maze_type,
                     render_size=frame_size,
                 )
-
-                for (pixel_x, pixel_y), (_, color, _) in zip(goal_pixels, goals_to_draw):
+                for (pixel_x, pixel_y), goal_data in zip(goal_pixels, goals_to_draw):
+                    _, color, goal_type, idx = goal_data
                     if 0 <= pixel_x < frame_size and 0 <= pixel_y < frame_size:
+                        adjusted_pixel_y = pixel_y
                         if frame.shape[0] == frame_size * 2:
-                            pixel_y += frame_size
+                            adjusted_pixel_y += frame_size
+                        # Draw circle
                         cv2.circle(
                             frame,
-                            (int(pixel_x), int(pixel_y)),
+                            (int(pixel_x), int(adjusted_pixel_y)),
                             goal_radius,
                             color,
                             -1
                         )
+                        # Draw index number if enabled and available
+                        if show_indices and idx is not None and goal_type in ['decoded', 'retrieved']:
+                            # Position text slightly offset from the circle
+                            text_x = int(pixel_x) + goal_radius + 3
+                            text_y = int(adjusted_pixel_y) - goal_radius - 3
 
+                            # Draw text with background for better visibility
+                            text = str(idx)
+                            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0]
+
+                            # # Draw white background rectangle
+                            # cv2.rectangle(
+                            #     frame,
+                            #     (text_x - 1, text_y - text_size[1] - 1),
+                            #     (text_x + text_size[0] + 1, text_y + 2),
+                            #     (255, 255, 255),
+                            #     -1
+                            # )
+
+                            # Draw text
+                            cv2.putText(
+                                frame,
+                                text,
+                                (text_x, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                font_scale,
+                                color,
+                                font_thickness,
+                                cv2.LINE_AA
+                            )
             traj_frames.append(np.concatenate([render_frame, frame], 0))
 
         all_frames.append(np.array(traj_frames))
