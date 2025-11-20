@@ -3,7 +3,18 @@ import cv2
 import wandb
 
 
-def visualize_goal_buffer_on_maze(goal_buffer, env, render_size=400, goal_color=(0, 255, 0), goal_radius=5):
+def visualize_goal_buffer_on_maze(
+    goal_buffer, 
+    env, 
+    render_size=1024, 
+    goal_color=(0, 255, 0), 
+    goal_radius=4,
+    value_fn=None,
+    arrow_scale=2,
+    arrow_color=(255, 0, 0),
+    arrow_thickness=1,
+    arrow_norm_stat='percentile',
+):
     """Visualize all stored goals in the buffer on a rendered maze image.
 
     Args:
@@ -12,12 +23,23 @@ def visualize_goal_buffer_on_maze(goal_buffer, env, render_size=400, goal_color=
         render_size: Size of the rendered image (width=height)
         goal_color: RGB color for goal markers (default: green)
         goal_radius: Radius of goal markers in pixels
+        value_fn: Optional value function v(s,g) that takes batched (states, goals) 
+                  and returns values. If provided, visualizes value gradients.
+        arrow_scale: Scale factor for gradient arrows (in pixels)
+        arrow_color: RGB color for gradient arrows (default: red)
+        arrow_thickness: Thickness of gradient arrow lines
 
     Returns:
-        rendered_image: RGB image (H, W, 3) with goals visualized
+        rendered_image: RGB image (H, W, 3) with goals and gradients visualized
     """
+    import jax
+    import jax.numpy as jnp
+
     # Render the maze
-    frame = env.render()  # Should return (H, W, 3) RGB image
+    _, info = env.reset()
+    env_goal = info.get('goal')
+    frame = env.render()
+    frame = cv2.resize(frame, (render_size, render_size))
 
     if len(goal_buffer.goal_observations) == 0:
         # Return empty render if buffer is empty
@@ -28,7 +50,6 @@ def visualize_goal_buffer_on_maze(goal_buffer, env, render_size=400, goal_color=
     maze_type = env.unwrapped._maze_type if hasattr(env, 'unwrapped') else env._maze_type
 
     # Extract xy coordinates from all goal observations
-    # Assuming goal_observations have xy in first 2 dimensions
     goal_xys = []
     for goal_obs in goal_buffer.goal_observations:
         # Convert from JAX array to numpy if needed
@@ -56,6 +77,97 @@ def visualize_goal_buffer_on_maze(goal_buffer, env, render_size=400, goal_color=
                 goal_color, 
                 -1  # Filled circle
             )
+
+    # Add final goal
+    env_goal_pixels = xy_to_pixel_coords(
+        env_goal[None], 
+        maze_map=maze_map,
+        maze_type=maze_type,
+        render_size=frame.shape[0]  # Assuming square render
+    )[0]
+    cv2.circle(
+        frame_with_goals, 
+        (int(env_goal_pixels[0]), int(env_goal_pixels[1])), 
+        goal_radius * 2,
+        (0,0,0), 
+        -1  # Filled circle
+    )
+
+    # Compute and visualize value gradients if value_fn is provided
+    if value_fn is not None and env_goal is not None:
+        # Convert buffer observations to JAX arrays for gradient computation
+        buffer_states = jnp.array([np.array(obs) for obs in goal_buffer.goal_observations])
+
+        # Expand goal to match batch size
+        goal_batch = jnp.tile(jnp.array(env_goal)[None, :], (len(buffer_states), 1))
+
+        # Define function to compute gradients
+        def compute_value_gradient(states, goals):
+            """Compute gradient of value function wrt states."""
+            def value_for_state(state):
+                # Compute value for single state with given goal
+                v = value_fn(state[None, :], goals[0:1])[0]
+                return v
+
+            # Compute gradients for each state
+            grad_fn = jax.grad(value_for_state)
+            gradients = jax.vmap(grad_fn)(states)
+            return gradients
+
+        # Compute gradients
+        gradients = compute_value_gradient(buffer_states, goal_batch)
+        gradients_np = np.array(gradients)  # Shape: (num_states, state_dim)
+
+        # Extract only x,y components (first 2 dimensions)
+        gradients_xy = gradients_np[:, :2]  # Shape: (num_states, 2)
+
+        # Compute magnitudes for normalization
+        magnitudes = np.linalg.norm(gradients_xy, axis=1, keepdims=True)
+        magnitudes = np.maximum(magnitudes, 1e-8)  # Avoid division by zero
+
+        # Normalize gradients and scale
+        normalized_gradients = gradients_xy / magnitudes
+        scaled_gradients = normalized_gradients * arrow_scale
+
+        # Also scale by relative magnitude for proportional sizing
+        norm_stat = {'median': np.median, 'mean': np.mean, 'max': np.max, 'percentile': (lambda x: np.percentile(x, 95))}[arrow_norm_stat](magnitudes)
+        if norm_stat > 0:
+            magnitude_scale = magnitudes / norm_stat
+            # magnitude_scale = np.maximum(magnitude_scale, 0.15)
+            scaled_gradients = scaled_gradients * magnitude_scale
+
+        # Convert gradient endpoints to pixel coordinates
+        # Start points are the goal positions
+        start_xys = goal_xys  # Shape: (num_goals, 2)
+        end_xys = start_xys + scaled_gradients  # Shape: (num_goals, 2)
+
+        # Convert to pixel coordinates
+        start_pixels = xy_to_pixel_coords(
+            start_xys,
+            maze_map=maze_map,
+            maze_type=maze_type,
+            render_size=frame.shape[0]
+        )
+
+        end_pixels = xy_to_pixel_coords(
+            end_xys,
+            maze_map=maze_map,
+            maze_type=maze_type,
+            render_size=frame.shape[0]
+        )
+
+        # Draw gradient arrows
+        for (start_x, start_y), (end_x, end_y) in zip(start_pixels, end_pixels):
+            if (0 <= start_x < frame.shape[1] and 0 <= start_y < frame.shape[0] and
+                0 <= end_x < frame.shape[1] and 0 <= end_y < frame.shape[0]):
+                cv2.line(
+                    frame_with_goals,
+                    (int(start_x), int(start_y)),
+                    (int(end_x), int(end_y)),
+                    arrow_color,
+                    arrow_thickness,
+                    cv2.LINE_AA
+                )
 
     return frame_with_goals
 
