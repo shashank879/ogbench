@@ -22,7 +22,7 @@ class GoalBuffer:
         Returns:
             Number of goals actually added
         """
-        assert len([x for x in [state_encoder, goal_rep_fn, value_fn] if x is not None]), 'Only one should be specified [state_encoder, goal_rep_fn, value_fn]'
+        assert (state_encoder is None) or (goal_rep_fn is None), 'Only one can be specified'
         if state_encoder:
             self.reencode_all(state_encoder=state_encoder)
             goal_embeddings = jax.vmap(state_encoder)(goal_observations)
