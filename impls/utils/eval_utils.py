@@ -333,7 +333,7 @@ def visualize_goals_on_trajectory(
                 assert len(traj['observation'][0].shape) == 1, 'Cannot plot Images'
                 for idx, decoded_goal in enumerate(decoded_subgoals):
                     decoded_goal_xy = np.array(decoded_goal)[:2]
-                    goals_to_draw.append((decoded_goal_xy, decoded_goal_color, 'decoded', idx))
+                    goals_to_draw.append((decoded_goal_xy, decoded_goal_color, 'decoded', 'G' if idx==0 else (idx-1)))
 
             # Add retrieved goal (from buffer)
             if 'subgoals' in traj and step_idx < len(traj['subgoals']):
@@ -342,7 +342,7 @@ def visualize_goals_on_trajectory(
                     retrieved_subgoals = retrieved_subgoals[:subgoal_first_reach_index+1]
                 for idx, retrieved_subgoal in enumerate(retrieved_subgoals):
                     retrieved_goal_xy = np.array(retrieved_subgoal)[:2]
-                    goals_to_draw.append((retrieved_goal_xy, retrieved_goal_color, 'retrieved', idx))
+                    goals_to_draw.append((retrieved_goal_xy, retrieved_goal_color, 'retrieved',  'G' if idx==0 else (idx-1)))
 
             # Add final target goal
             if final_goal_xy is not None:
@@ -380,15 +380,6 @@ def visualize_goals_on_trajectory(
                             # Draw text with background for better visibility
                             text = str(idx)
                             text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0]
-
-                            # # Draw white background rectangle
-                            # cv2.rectangle(
-                            #     frame,
-                            #     (text_x - 1, text_y - text_size[1] - 1),
-                            #     (text_x + text_size[0] + 1, text_y + 2),
-                            #     (255, 255, 255),
-                            #     -1
-                            # )
 
                             # Draw text
                             cv2.putText(
