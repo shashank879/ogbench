@@ -57,6 +57,7 @@ def main(_):
     else:
         FLAGS.save_dir = os.path.join(FLAGS.save_dir, 'debug', exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
+    print('[SAVE DIR] : ', FLAGS.save_dir)
     flag_dict = get_flag_dict()
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f)
@@ -109,7 +110,7 @@ def main(_):
             update_info.update(non_jit_update_info)
 
         # Log metrics.
-        if i==1 or i % FLAGS.log_interval == 0:
+        if i % FLAGS.log_interval == 0:
             if i > 1:
                 train_metrics = {f'training/{k}': v for k, v in update_info.items()}
                 if val_dataset is not None:
@@ -122,14 +123,13 @@ def main(_):
             else:
                 train_metrics = {}
 
-            if hasattr(agent, 'goal_buffer'):
+            if hasattr(env.unwrapped, 'maze_map') and len(batch['observations'].shape) == 2 and hasattr(agent, 'goal_buffer'):
                 # Add rendered goal positions as summary
                 buffer_frame = visualize_goal_buffer_on_maze(
                     goal_buffer=agent.goal_buffer,
                     env=env,
                     render_size=1024,
-                    goal_color=(0, 255, 0),  # Green
-                    goal_radius=1,
+                    value_fn=lambda s,g: agent.network.select(config['high_act_val_fn'])(s,g).mean(0)
                 )
                 train_metrics['buffer_goals'] = wandb.Image(buffer_frame)
 
@@ -185,7 +185,7 @@ def main(_):
                     eval_metrics['video'] = video
 
                 # Goal visualization video
-                if hasattr(agent, 'goal_buffer') and len(render_trajs) > 0 and 'subgoals' in render_trajs[0]:
+                if hasattr(env.unwrapped, 'maze_map') and len(batch['observations'].shape) == 2 and  hasattr(agent, 'goal_buffer') and len(render_trajs) > 0 and 'subgoals' in render_trajs[0]:
                     goal_video: wandb.Video = create_goal_trajectory_video(
                         render_trajs,
                         env,
