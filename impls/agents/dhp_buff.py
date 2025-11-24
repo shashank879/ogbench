@@ -473,7 +473,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         first_reach_index = jnp.argmax(first_reach, axis=0)  # Scalar
 
         # Extract first reachable subgoal using weighted sum
-        first_subgoal = jnp.sum(first_reach[:, None] * subgoals, axis=0)  # Shape: (obs_dim,)
+        first_subgoal = jnp.sum(jnp.expand_dims(first_reach, [i+1 for i in range(len(subgoals.shape) - len(first_reach.shape))]) * subgoals, axis=0)
 
         info['subgoals'] = subgoals
         info['decoded_subgoals'] = dec_goal_emb

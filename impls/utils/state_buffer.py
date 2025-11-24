@@ -36,7 +36,7 @@ class GoalBuffer:
                 self.reference_state = jnp.zeros_like(goal_observations[0])
 
             # Create batched input: [s_ref; g] for all g
-            ref_repeated = jnp.tile(self.reference_state[None, :], (len(goal_observations), 1))
+            ref_repeated = jnp.broadcast_to(self.reference_state[None], (len(goal_observations), *self.reference_state.shape))
 
             # Compute embeddings in batch
             goal_embeddings = jax.vmap(goal_rep_fn)(ref_repeated, goal_observations)
@@ -160,8 +160,8 @@ class GoalBuffer:
 
                 # Compute (chunk_i_size, chunk_j_size) distance matrix
                 # Expand dimensions for broadcasting
-                s_expanded = jnp.tile(chunk_obs_i[:, None, :], (1, len(chunk_obs_j), 1))
-                g_expanded = jnp.tile(chunk_obs_j[None, :, :], (len(chunk_obs_i), 1, 1))
+                s_expanded = jnp.broadcast_to(chunk_obs_i[:, None, ...], (len(chunk_obs_i), len(chunk_obs_j), *chunk_obs_i[0].shape))
+                g_expanded = jnp.broadcast_to(chunk_obs_j[None, :, ...], (len(chunk_obs_i), len(chunk_obs_j), *chunk_obs_j[0].shape))
 
                 # value_fn should be vectorized to handle batched inputs
                 chunk_dist = value_fn(s_expanded, g_expanded)
@@ -190,7 +190,7 @@ class GoalBuffer:
 
         if goal_rep_fn:
             # Value-weighted retrieval: balance distance and reachability
-            current_state_expanded = jnp.tile(current_state, (len(self.goal_observations), 1))
+            current_state_expanded = jnp.broadcast_to(current_state[None], (len(self.goal_observations), *current_state.shape))
             pred_goal_rep = jax.vmap(goal_rep_fn)(current_state_expanded, observations_array)
             distances = jnp.linalg.norm(goal_rep_query - pred_goal_rep, axis=1)
             best_idx = distances.argmin()
@@ -230,7 +230,7 @@ class GoalBuffer:
             if self.reference_state is None:
                 self.reference_state = jnp.zeros_like(observations_array[0])
 
-            ref_repeated = jnp.tile(self.reference_state[None, :], (len(observations_array), 1))
+            ref_repeated = jnp.broadcast_to(self.reference_state[None], (len(self.goal_observations), *self.reference_state.shape))
             new_embeddings = jax.vmap(goal_rep_fn)(ref_repeated, observations_array)
         else:
             new_embeddings = state_encoder(observations_array)
