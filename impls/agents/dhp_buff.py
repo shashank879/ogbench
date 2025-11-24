@@ -156,10 +156,40 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
 
     def high_actor_loss(self, batch, grad_params):
         """Compute the high-level actor loss."""
-        v1, v2 = self.network.select('high_value')(batch['observations'], batch['high_actor_goals'])
-        nv1, nv2 = self.network.select('high_value')(batch['high_actor_targets'], batch['high_actor_goals'])
+        v1, v2 = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals'])
+        nv1, nv2 = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals'])
         v = (v1 + v2) / 2
         nv = (nv1 + nv2) / 2
+        adv = nv - v
+
+        exp_a = jnp.exp(adv * self.config['high_alpha'])
+        exp_a = jnp.minimum(exp_a, 100.0)
+
+        dist = self.network.select('high_actor')(batch['observations'], batch['high_actor_goals'], params=grad_params)
+        target = self.network.select('goal_rep')(
+            jnp.concatenate([batch['observations'], batch['high_actor_targets']], axis=-1)
+        )
+        log_prob = dist.log_prob(target)
+
+        actor_loss = -(exp_a * log_prob).mean()
+
+        return actor_loss, {
+            'actor_loss': actor_loss,
+            'adv': adv.mean(),
+            'bc_log_prob': log_prob.mean(),
+            'mse': jnp.mean((dist.mode() - target) ** 2),
+            'std': jnp.mean(dist.scale_diag),
+            'v': v.mean(),
+            'v_std': v.std(),
+            'next_v': nv.mean(),
+        }
+
+    def high_actor_hierplan_loss(self, batch, grad_params):
+        """Compute the high-level actor loss."""
+        v = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals']).mean(0)
+        left_nv = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_targets']).mean(0)
+        right_nv = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals']).mean(0)
+        nv = self.merge_op(left_nv, right_nv)
         adv = nv - v
 
         exp_a = jnp.exp(adv * self.config['high_alpha'])
@@ -257,7 +287,10 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         for k, v in low_actor_info.items():
             info[f'low_actor/{k}'] = v
 
-        high_actor_loss, high_actor_info = self.high_actor_loss(batch, grad_params)
+        if self.config['hierarchical_planner']:
+            high_actor_loss, high_actor_info = self.high_actor_hierplan_loss(batch, grad_params)
+        else:
+            high_actor_loss, high_actor_info = self.high_actor_loss(batch, grad_params)
         for k, v in high_actor_info.items():
             info[f'high_actor/{k}'] = v
 
@@ -660,7 +693,8 @@ def get_config():
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             hierarchical_planner=True,
             reachable_thresh_val=-2,
-            hierplan_depth=1,
+            hierplan_depth=8,
+            high_act_val_fn='high_value',  # [high_value, low_value]
 
             # Goal buffer hyperparameters
             use_goal_decoder=True,  # Whether to use goal decoder and buffer
