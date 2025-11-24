@@ -355,11 +355,10 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         """
         info = {}
 
-        if not (step==1 or step % self.config['buffer_update_freq'] == 0):
-            return info
+        update = (not self.goal_buffer.is_full()) or (step % self.config['buffer_update_freq'] == 0)
 
         # Update goal buffer if enabled
-        if (self.goal_buffer is not None and self.config['use_goal_decoder']):
+        if update and (self.goal_buffer is not None and self.config['use_goal_decoder']):
             # Add to buffer
             added_count = self.goal_buffer.add_batch(
                 batch['low_value_goals'],

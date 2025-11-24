@@ -12,6 +12,9 @@ class GoalBuffer:
         self.goal_embeddings = []  # List of goal embeddings (emb_g)
         self.goal_observations = []  # List of actual goal observations
 
+    def is_full(self):
+        return len(self.goal_observations) >= self.capacity
+
     def add_batch(self, goal_observations, state_encoder=None, goal_rep_fn=None, value_fn=None):
         """Add a batch of goals efficiently using vectorized diversity selection.
 
@@ -102,12 +105,12 @@ class GoalBuffer:
 
         # Compute all pairwise distances once (vectorized)
         # Shape: (n, n)
-        x = jnp.tile(embeddings[:, None, :], (1, n, 1))
-        y = jnp.tile(embeddings[None, :, :], (n, 1, 1))
         if value_fn:
             pairwise_distances = self._compute_pairwise_chunked(
                 embeddings, value_fn)
         else:
+            x = jnp.tile(embeddings[:, None, :], (1, n, 1))
+            y = jnp.tile(embeddings[None, :, :], (n, 1, 1))
             distance_fn = lambda x,y: jnp.linalg.norm(x - y, axis=-1)
             pairwise_distances = distance_fn(x, y)
 
