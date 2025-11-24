@@ -434,12 +434,12 @@ class DHPDataset(HGCDataset):
         final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
         distances = np.random.rand(batch_size)  # in [0, 1)
         value_goal_idxs = np.round(
-            (np.minimum(idxs + self.config['subgoal_steps'] + 1, final_state_idxs) * distances +
+            (np.minimum(idxs + 2, final_state_idxs) * distances +
             final_state_idxs * (1 - distances))
         ).astype(int)
 
         if normal_subgoal_sample:
-            subgoal_distances = np.clip(np.random.normal(0.25, 0.25, batch_size), 0, 1)
+            subgoal_distances = np.clip(np.random.normal(0.5, 0.5, batch_size), 0, 1)
         else:
             subgoal_distances = np.random.rand(batch_size)  # in [0, 1)
 
@@ -504,8 +504,9 @@ class DHPDataset(HGCDataset):
         batch['high_value_goals'] = self.get_observations(value_goal_idxs)
         batch['high_value_subgoals'] = self.get_observations(value_subgoal_idxs)
 
-        successes_left = (np.abs(idxs - value_subgoal_idxs) < self.config['subgoal_steps']).astype(float)
-        successes_right = (np.abs(value_subgoal_idxs - value_goal_idxs) < self.config['subgoal_steps']).astype(float)
+        step_dist = self.config.get('high_value_min_dist', self.config['subgoal_steps'])
+        successes_left = (np.abs(idxs - value_subgoal_idxs) <= step_dist).astype(float)
+        successes_right = (np.abs(value_subgoal_idxs - value_goal_idxs) <= step_dist).astype(float)
         batch['masks_left'] = 1.0 - successes_left
         batch['masks_right'] = 1.0 - successes_right
         batch['rewards_left'] = successes_left - (1.0 if self.config['gc_negative'] else 0.0)
@@ -527,17 +528,21 @@ class DHPDataset(HGCDataset):
             high_traj_goal_idxs = np.round(
                 (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
             ).astype(int)
-        high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
-        # high_traj_target_idxs = np.minimum(
-        #     (idxs + high_traj_goal_idxs) // 2,
-        #     high_traj_goal_idxs)
+        if self.config['hierarchical_planner']:
+            high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
+        else:
+            high_traj_target_idxs = np.minimum(
+                (idxs + high_traj_goal_idxs) // 2,
+                high_traj_goal_idxs)
 
         # High-level random goals.
         high_random_goal_idxs = self.dataset.get_random_idxs(batch_size)
-        high_random_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
-        # high_random_target_idxs = np.minimum(
-        #     (idxs + high_traj_goal_idxs) // 2,
-        #     final_state_idxs)
+        if self.config['hierarchical_planner']:
+            high_random_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
+        else:
+            high_random_target_idxs = np.minimum(
+                (idxs + high_traj_goal_idxs) // 2,
+                final_state_idxs)
 
         # Pick between high-level future goals and random goals.
         pick_random = np.random.rand(batch_size) < self.config['actor_p_randomgoal']

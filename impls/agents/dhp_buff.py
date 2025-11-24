@@ -713,7 +713,8 @@ def get_config():
             high_value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
             high_value_p_trajgoal=0.7,  # Probability of using a future state in the same trajectory as the value goal.
             high_value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
-            high_value_normal_subg_sample=True,  # Whether to use geometric sampling for future value goals.
+            high_value_normal_subg_sample=False,  # Whether to use geometric sampling for future value goals.
+            # high_value_min_dist=1,
             merge_type='min',
             actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
             actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
