@@ -8,7 +8,7 @@ import ml_collections
 import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize
+from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize, RunningMeanStd
 from utils.state_buffer import GoalBuffer
 
 
@@ -18,6 +18,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
     rng: Any
     network: Any
     goal_buffer: GoalBuffer = nonpytree_field()
+    low_actor_val_norm: RunningMeanStd
     config: Any = nonpytree_field()
 
     @staticmethod
@@ -131,6 +132,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         log_prob = dist.log_prob(batch['actions'])
 
         actor_loss = -(exp_a * log_prob).mean()
+        norm_v = self.low_actor_val_norm.normalize(v)
 
         actor_info = {
             'actor_loss': actor_loss,
@@ -139,6 +141,8 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             'v': v.mean(),
             'v_std': v.std(),
             'next_v': nv.mean(),
+            'norm_v_mean': norm_v.mean(),
+            'norm_v_std': norm_v.std(),
         }
         if not self.config['discrete']:
             actor_info.update(
@@ -278,6 +282,16 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
 
+    def norm_update(self, batch):
+        v = self.network.select('low_value')(batch['observations'], batch['low_actor_goals']).mean(0)
+        new_low_actor_val_norm = self.low_actor_val_norm.update(v)
+        info = {
+            'low_actor/norm_mean': new_low_actor_val_norm.mean,
+            'low_actor/norm_std': jnp.sqrt(new_low_actor_val_norm.var),
+            'low_actor/norm_count': new_low_actor_val_norm.count,
+        }
+        return new_low_actor_val_norm, info
+
     @jax.jit
     def update(self, batch):
         """Update the agent and return a new agent with information dictionary."""
@@ -290,7 +304,10 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         self.target_update(new_network, 'low_value')
         self.target_update(new_network, 'high_value')
 
-        return self.replace(network=new_network, rng=new_rng), info
+        new_norm_net, norm_info = self.norm_update(batch)
+        info.update(norm_info)
+
+        return self.replace(network=new_network, low_actor_val_norm=new_norm_net, rng=new_rng), info
 
     def non_jit_update(self, batch, step):
         """Non-JIT updates including goal buffer population.
@@ -412,7 +429,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         subgoals = jnp.concatenate([goals[None], subgoals], axis=0)  # Shape: (depth+1, obs_dim)
         dec_goal_emb = jnp.concatenate([goals[None], dec_goal_emb], axis=0)  # Shape: (depth+1, obs_dim)
         low_value_pred = self.network.select('low_value')(jnp.stack([observations] * subgoals.shape[0], 0), subgoals).mean(0)  # Shape: (depth+1,)
-        reachable = low_value_pred >= self.config['reachable_thresh_val']
+        reachable = self.low_actor_val_norm.normalize(low_value_pred) >= self.config['reachable_thresh_val']
         cont = jax.lax.cumprod(1 - reachable, axis=0)  # Shape: (depth+1,)
 
         # Mark last subgoal as always reachable (fallback)
@@ -616,7 +633,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
                 reference_state=ex_observations[0],
             )
 
-        return cls(rng, network=network, goal_buffer=goal_buffer, config=flax.core.FrozenDict(**config))
+        return cls(rng, network=network, goal_buffer=goal_buffer, low_actor_val_norm=RunningMeanStd(), config=flax.core.FrozenDict(**config))
 
 
 def get_config():
@@ -642,7 +659,7 @@ def get_config():
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             hierarchical_planner=True,
-            reachable_thresh_val=-20,
+            reachable_thresh_val=-2,
             hierplan_depth=1,
 
             # Goal buffer hyperparameters
