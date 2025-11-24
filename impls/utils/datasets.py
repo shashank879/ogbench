@@ -529,20 +529,20 @@ class DHPDataset(HGCDataset):
                 (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
             ).astype(int)
         if self.config['hierarchical_planner']:
-            high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
-        else:
             high_traj_target_idxs = np.minimum(
                 (idxs + high_traj_goal_idxs) // 2,
                 high_traj_goal_idxs)
+        else:
+            high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
 
         # High-level random goals.
         high_random_goal_idxs = self.dataset.get_random_idxs(batch_size)
         if self.config['hierarchical_planner']:
-            high_random_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
-        else:
             high_random_target_idxs = np.minimum(
                 (idxs + high_traj_goal_idxs) // 2,
                 final_state_idxs)
+        else:
+            high_random_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
 
         # Pick between high-level future goals and random goals.
         pick_random = np.random.rand(batch_size) < self.config['actor_p_randomgoal']
