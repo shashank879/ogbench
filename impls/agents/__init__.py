@@ -7,7 +7,7 @@ from agents.qrl import QRLAgent
 from agents.sac import SACAgent
 from agents.dhp_1value import DHPv1Agent
 from agents.dhp_2value import DHPv2Agent
-from agents.dhp_wBuff import DHPBufferAgent
+from agents.dhp_buff import DHPBufferAgent
 from agents.dhp import DHPAgent
 
 agents = dict(
