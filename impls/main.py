@@ -185,7 +185,7 @@ def main(_):
                     eval_metrics['video'] = video
 
                 # Goal visualization video
-                if hasattr(env.unwrapped, 'maze_map') and len(batch['observations'].shape) == 2 and  hasattr(agent, 'goal_buffer') and len(render_trajs) > 0 and 'subgoals' in render_trajs[0]:
+                if hasattr(env.unwrapped, 'maze_map') and hasattr(agent, 'goal_buffer') and len(render_trajs) > 0 and 'subgoals' in render_trajs[0]:
                     goal_video: wandb.Video = create_goal_trajectory_video(
                         render_trajs,
                         env,

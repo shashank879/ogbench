@@ -220,8 +220,14 @@ def xy_to_pixel_coords(xys, maze_map, maze_type, render_size):
     return pixel_coords
 
 
+def is_visual_observation(obs):
+    """Check if observation is visual (image) or state-based (vector)."""
+    obs_array = np.array(obs)
+    return len(obs_array.shape) >= 3  # Images have at least 3 dimensions (H, W, C)
+
+
 def visualize_goals_on_trajectory(
-    trajectories, 
+    trajectories,
     env,
     renders=None,
     render_size=400,
@@ -230,34 +236,87 @@ def visualize_goals_on_trajectory(
     final_goal_color=(255, 255, 0),  # Yellow for final goal
     goal_radius=2,
     goal_buffer=None,
-    show_indices=True,  # New parameter to control index display
-    font_scale=0.4,  # Size of the index text
-    font_thickness=1,  # Thickness of the index text
+    show_indices=True,
+    font_scale=0.4,
+    font_thickness=1,
+    goal_layout='horizontal',  # 'horizontal', 'vertical', or 'grid'
+    max_goals_display=10,
+    resize_goals=True,
+    goal_border_width=2,
 ):
-    """Visualize predicted and retrieved goals on trajectory renders.
+    """Visualize goals on trajectory renders for both state-based and visual observations.
+
+    Automatically detects whether subgoals are state-based (coordinates) or visual (images)
+    and uses the appropriate visualization method.
 
     Creates renders showing:
-    - Red circles: Decoded goals (predicted by high-level policy)
-    - Blue circles: Retrieved goals (from buffer)
-    - Yellow circle: Final target goal
+    - For state-based: Colored circles at goal positions
+    - For visual: Concatenated subgoal images with colored borders
 
     Args:
         trajectories: List of trajectory dicts from evaluate()
-        env: The maze environment
+        env: The environment
+        renders: Pre-rendered frames for each trajectory
         render_size: Size of rendered frames
+
+        # State-based visualization parameters:
         decoded_goal_color: RGB color for decoded goals
         retrieved_goal_color: RGB color for retrieved goals
         final_goal_color: RGB color for final target goal
         goal_radius: Radius of goal markers in pixels
-        show_indices: Whether to show index numbers next to goals
+        goal_buffer: Optional buffer of goals to visualize
+
+        # Visual observation parameters:
+        goal_layout: How to arrange multiple subgoals ('horizontal', 'vertical', 'grid')
+        max_goals_display: Maximum number of subgoals to show
+        resize_goals: Whether to resize subgoal images to match frame dimensions
+        goal_border_width: Width of borders between goals
+
+        # Common parameters:
+        show_indices: Whether to show index numbers
         font_scale: Size of index text
         font_thickness: Thickness of index text
+
     Returns:
         List of frame arrays with goal visualizations
     """
+    # Detect if we're using visual observations
+    use_visual = False
+    for traj in trajectories:
+        if 'decoded_subgoals' in traj and len(traj['decoded_subgoals']) > 0:
+            if len(traj['decoded_subgoals'][0]) > 0:
+                use_visual = is_visual_observation(traj['decoded_subgoals'][0][0])
+                break
+        elif 'subgoals' in traj and len(traj['subgoals']) > 0:
+            if len(traj['subgoals'][0]) > 0:
+                use_visual = is_visual_observation(traj['subgoals'][0][0])
+                break
+
+    if use_visual:
+        return _visualize_visual_goals(
+            trajectories, env, renders, render_size,
+            goal_layout, max_goals_display, resize_goals,
+            decoded_goal_color, retrieved_goal_color, final_goal_color,
+            goal_border_width, show_indices, font_scale, font_thickness
+        )
+    else:
+        return _visualize_state_goals(
+            trajectories, env, renders, render_size,
+            decoded_goal_color, retrieved_goal_color, final_goal_color,
+            goal_radius, goal_buffer, show_indices, font_scale, font_thickness
+        )
+
+
+def _visualize_state_goals(
+    trajectories, env, renders, render_size,
+    decoded_goal_color, retrieved_goal_color, final_goal_color,
+    goal_radius, goal_buffer, show_indices, font_scale, font_thickness
+):
+    """Visualize state-based goals as circles on trajectory (original implementation)."""
+    from your_utils import xy_to_pixel_coords  # Import your coordinate conversion function
+
     maze_map = env.unwrapped.maze_map if hasattr(env, 'unwrapped') else env.maze_map
     maze_type = env.unwrapped._maze_type if hasattr(env, 'unwrapped') else env._maze_type
-
     all_frames = []
 
     for traj, render in zip(trajectories, renders):
@@ -267,6 +326,7 @@ def visualize_goals_on_trajectory(
         else:
             frame_size = render_size
         assert len(traj['observation']) == len(render), 'Length mismatch'
+
         # Get final goal from trajectory info
         final_goal_obs = traj['goal'][-1]
         if final_goal_obs is not None:
@@ -276,18 +336,16 @@ def visualize_goals_on_trajectory(
 
         traj_frames = []
         for step_idx in range(len(traj['observation'])):
-            # Render the environment at this state
             obs = traj['observation'][step_idx]
             subgoal_first_reach_index = traj['subgoal_first_reach_index'][step_idx] if 'subgoal_first_reach_index' in traj else -1
 
-            # Set the environment to this state and render
-            # For antmaze, the first 2 dims are xy position
             agent_xy = obs[:2]
             if renders:
                 render_frame = render[min(step_idx, len(render) - 1)]
             else:
                 env.unwrapped.set_xy(agent_xy) if hasattr(env, 'unwrapped') else env.set_xy(agent_xy)
                 render_frame = env.render().copy()
+
             frame = np.zeros((frame_size, frame_size, 3), dtype=np.uint8) + 255
 
             if goal_buffer:
@@ -312,30 +370,22 @@ def visualize_goals_on_trajectory(
                 for pixel_x, pixel_y in goal_pixels:
                     if frame.shape[0] == 2*frame_size:
                         pixel_y += frame_size
-                    # Ensure coordinates are within bounds
                     if 0 <= pixel_x < frame.shape[1] and 0 <= pixel_y < frame.shape[0]:
-                        cv2.circle(
-                            frame, 
-                            (int(pixel_x), int(pixel_y)), 
-                            1, 
-                            (0, 255, 0), 
-                            -1  # Filled circle
-                        )
+                        cv2.circle(frame, (int(pixel_x), int(pixel_y)), 1, (0, 255, 0), -1)
 
-            # Convert goals to pixel coordinates
             goals_to_draw = []
 
-            # Add decoded goal (predicted subgoal)
+            # Add decoded goals
             if 'decoded_subgoals' in traj and step_idx < len(traj['decoded_subgoals']):
                 decoded_subgoals = traj['decoded_subgoals'][step_idx]
                 if subgoal_first_reach_index > -1:
                     decoded_subgoals = decoded_subgoals[:subgoal_first_reach_index+1]
-                assert len(traj['observation'][0].shape) == 1, 'Cannot plot Images'
+
                 for idx, decoded_goal in enumerate(decoded_subgoals):
                     decoded_goal_xy = np.array(decoded_goal)[:2]
                     goals_to_draw.append((decoded_goal_xy, decoded_goal_color, 'decoded', 'G' if idx==0 else (idx-1)))
 
-            # Add retrieved goal (from buffer)
+            # Add retrieved goals
             if 'subgoals' in traj and step_idx < len(traj['subgoals']):
                 retrieved_subgoals = traj['subgoals'][step_idx]
                 if subgoal_first_reach_index > -1:
@@ -347,7 +397,9 @@ def visualize_goals_on_trajectory(
             # Add final target goal
             if final_goal_xy is not None:
                 goals_to_draw.append((final_goal_xy, final_goal_color, 'target', None))
+
             goals_to_draw.append((agent_xy, (0, 0, 0), 'agent', None))
+
             # Draw goals on frame
             if len(goals_to_draw) > 0:
                 goal_xys = np.array([g[0] for g in goals_to_draw])
@@ -357,13 +409,14 @@ def visualize_goals_on_trajectory(
                     maze_type=maze_type,
                     render_size=frame_size,
                 )
+
                 for (pixel_x, pixel_y), goal_data in zip(goal_pixels, goals_to_draw):
                     _, color, goal_type, idx = goal_data
                     if 0 <= pixel_x < frame_size and 0 <= pixel_y < frame_size:
                         adjusted_pixel_y = pixel_y
                         if frame.shape[0] == frame_size * 2:
                             adjusted_pixel_y += frame_size
-                        # Draw circle
+
                         cv2.circle(
                             frame,
                             (int(pixel_x), int(adjusted_pixel_y)),
@@ -392,12 +445,205 @@ def visualize_goals_on_trajectory(
                                 font_thickness,
                                 cv2.LINE_AA
                             )
+
             traj_frames.append(np.concatenate([render_frame, frame], 0))
+        all_frames.append(np.array(traj_frames))
+
+    return all_frames
+
+
+def _visualize_visual_goals(
+    trajectories, env, renders, render_size,
+    goal_layout, max_goals_display, resize_goals,
+    decoded_goal_color, retrieved_goal_color, final_goal_color,
+    goal_border_width, show_indices, font_scale, font_thickness,
+    upscale_factor=4.0,
+):
+    """Visualize visual goals as concatenated images."""
+    all_frames = []
+
+    for traj_idx, (traj, render) in enumerate(zip(trajectories, renders)):
+        if renders is not None:
+            frame_height, frame_width = render.shape[1], render.shape[2]
+        else:
+            frame_height = frame_width = render_size
+
+        assert len(traj['observation']) == len(render), f'Length mismatch: {len(traj["observation"])} vs {len(render)}'
+
+        traj_frames = []
+
+        for step_idx in range(len(traj['observation'])):
+            # Get the render frame
+            if renders is not None:
+                render_frame = render[min(step_idx, len(render) - 1)].copy()
+            else:
+                obs = traj['observation'][step_idx]
+                agent_xy = obs[:2]
+                env.unwrapped.set_xy(agent_xy) if hasattr(env, 'unwrapped') else env.set_xy(agent_xy)
+                render_frame = env.render().copy()
+
+            # Collect subgoals to visualize
+            subgoals_to_viz = []
+            subgoal_first_reach_index = traj.get('subgoal_first_reach_index', [None])[step_idx]
+
+            # Check for retrieved subgoals
+            if 'subgoals' in traj and step_idx < len(traj['subgoals']):
+                retrieved_subgoals = traj['subgoals'][step_idx]
+                if subgoal_first_reach_index is not None and subgoal_first_reach_index > -1:
+                    retrieved_subgoals = retrieved_subgoals[:subgoal_first_reach_index + 1]
+
+                for idx, subgoal in enumerate(retrieved_subgoals[:max_goals_display]):
+                    subgoals_to_viz.append({
+                        'image': np.array(subgoal),
+                        'type': 'retrieved',
+                        'index': 'G' if idx == 0 else str(idx - 1),
+                        'border_color': final_goal_color if idx==0 else retrieved_goal_color
+                    })
+
+            # # Add final goal
+            # if 'goal' in traj and step_idx < len(traj['goal']):
+            #     final_goal = traj['goal'][step_idx]
+            #     if final_goal is not None and is_visual_observation(final_goal):
+            #         subgoals_to_viz.append({
+            #             'image': np.array(final_goal),
+            #             'type': 'final',
+            #             'index': 'F',
+            #             'border_color': final_goal_color
+            #         })
+
+            # Create visualization of subgoals
+            if len(subgoals_to_viz) > 0:
+                goal_viz = _create_goal_visualization(
+                    list(reversed(subgoals_to_viz)),
+                    target_height=int(frame_height / 4 * upscale_factor),
+                    target_width=int(frame_width * upscale_factor),
+                    layout=goal_layout,
+                    border_width=goal_border_width,
+                    show_indices=show_indices,
+                    font_scale=font_scale,
+                    font_thickness=font_thickness,
+                    resize_goals=resize_goals
+                )
+
+                # Concatenate render and goal visualization
+                if upscale_factor != 1:
+                    render_frame = cv2.resize(render_frame, (int(render_frame.shape[1] * upscale_factor), int(render_frame.shape[0] * upscale_factor)))
+                combined_frame = np.concatenate([render_frame, goal_viz], axis=0)
+            else:
+                # No subgoals, just use render
+                combined_frame = render_frame
+
+            traj_frames.append(combined_frame)
 
         all_frames.append(np.array(traj_frames))
 
     return all_frames
 
+
+def _create_goal_visualization(
+    subgoals,
+    target_height,
+    target_width,
+    layout='horizontal',
+    border_width=2,
+    show_indices=True,
+    font_scale=0.5,
+    font_thickness=2,
+    resize_goals=True
+):
+    """Create a visualization panel for subgoal images."""
+    if len(subgoals) == 0:
+        return np.ones((target_height, target_width, 3), dtype=np.uint8) * 255
+
+    # Process each subgoal image
+    processed_goals = []
+    for sg in subgoals:
+        img = sg['image'].copy()
+
+        # Ensure image is uint8 and has 3 channels
+        if img.dtype != np.uint8:
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = img.astype(np.uint8)
+
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+
+        # Add colored border
+        border_c = sg['border_color']
+        img = cv2.copyMakeBorder(
+            img, 
+            border_width, border_width, border_width, border_width,
+            cv2.BORDER_CONSTANT, 
+            value=border_c
+        )
+
+        # Add index label if requested
+        if show_indices and sg['index'] is not None:
+            text = str(sg['index'])
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0]
+            cv2.rectangle(img, (5, 5), (15 + text_size[0], 15 + text_size[1]), (0, 0, 0), -1)
+            cv2.putText(
+                img, text, (10, 10 + text_size[1]),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
+                font_thickness, cv2.LINE_AA
+            )
+
+        processed_goals.append(img)
+
+    # Arrange based on layout
+    if layout == 'horizontal':
+        combined = np.concatenate(processed_goals, axis=1)
+    elif layout == 'vertical':
+        combined = np.concatenate(processed_goals, axis=0)
+    elif layout == 'grid':
+        n_goals = len(processed_goals)
+        n_cols = int(np.ceil(np.sqrt(n_goals)))
+        n_rows = int(np.ceil(n_goals / n_cols))
+
+        # Pad to fill grid
+        while len(processed_goals) < n_rows * n_cols:
+            processed_goals.append(np.ones_like(processed_goals[0]) * 255)
+
+        rows = []
+        for r in range(n_rows):
+            row = np.concatenate(processed_goals[r * n_cols:(r + 1) * n_cols], axis=1)
+            rows.append(row)
+        combined = np.concatenate(rows, axis=0)
+
+    # Resize to target dimensions if requested
+    if resize_goals:
+        h, w = combined.shape[:2]
+        # Calculate scaling to fit within target while preserving aspect ratio
+        scale = min(target_width / w, target_height / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        combined = cv2.resize(combined, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # Pad to exactly match target dimensions
+        pad_h = target_height - new_h
+        pad_w = target_width - new_w
+        combined = cv2.copyMakeBorder(
+            combined, 0, pad_h, 0, pad_w,
+            cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        )
+    else:
+        # Pad or crop to match target dimensions
+        h, w = combined.shape[:2]
+        if h < target_height or w < target_width:
+            pad_h = max(0, target_height - h)
+            pad_w = max(0, target_width - w)
+            combined = cv2.copyMakeBorder(
+                combined, 0, pad_h, 0, pad_w,
+                cv2.BORDER_CONSTANT, value=(255, 255, 255)
+            )
+        if combined.shape[0] > target_height or combined.shape[1] > target_width:
+            combined = combined[:target_height, :target_width]
+
+    return combined
 
 def create_goal_trajectory_video(
     trajectories,
@@ -405,31 +651,37 @@ def create_goal_trajectory_video(
     renders=None,
     render_size=400,
     n_cols=None,
-    goal_buffer=None
+    goal_buffer=None,
+    **kwargs
 ):
     """Create a video grid showing goal visualizations across trajectories.
+
+    Works for both state-based and visual observations.
 
     Args:
         trajectories: List of trajectory dicts from evaluate()
         env: The maze environment
+        renders: Pre-rendered frames
         render_size: Size of rendered frames
         n_cols: Number of columns in video grid (auto if None)
+        goal_buffer: Optional buffer of goals (for state-based only)
+        **kwargs: Additional arguments passed to visualize_goals_on_trajectory
 
     Returns:
-        wandb.Video object or video array
+        wandb.Video object
     """
     # Generate frames with goal visualizations
     trajectory_frames = visualize_goals_on_trajectory(
-        trajectories, env, renders=renders, render_size=render_size, goal_buffer=goal_buffer
+        trajectories, env, renders=renders, render_size=render_size,
+        goal_buffer=goal_buffer, **kwargs
     )
 
-    # Use the same grid layout as the main video
     # Pad trajectories to same length
     max_len = max(len(frames) for frames in trajectory_frames)
     padded_frames = []
+
     for frames in trajectory_frames:
         if len(frames) < max_len:
-            # Repeat last frame to pad
             last_frame = frames[-1]
             padding = np.stack([last_frame] * (max_len - len(frames)))
             frames = np.concatenate([frames, padding], axis=0)
@@ -438,7 +690,6 @@ def create_goal_trajectory_video(
     # Stack into grid
     if n_cols is None:
         n_cols = int(np.ceil(np.sqrt(len(padded_frames))))
-
     n_rows = int(np.ceil(len(padded_frames) / n_cols))
 
     # Pad to fill grid
@@ -460,7 +711,6 @@ def create_goal_trajectory_video(
         grid_frames.append(grid_frame)
 
     video_array = np.array(grid_frames)
-
     # Convert to format expected by wandb (T, H, W, C) -> (T, C, H, W)
     video_array = video_array.transpose(0, 3, 1, 2)
 
