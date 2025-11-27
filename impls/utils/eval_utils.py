@@ -313,7 +313,6 @@ def _visualize_state_goals(
     goal_radius, goal_buffer, show_indices, font_scale, font_thickness
 ):
     """Visualize state-based goals as circles on trajectory (original implementation)."""
-    from your_utils import xy_to_pixel_coords  # Import your coordinate conversion function
 
     maze_map = env.unwrapped.maze_map if hasattr(env, 'unwrapped') else env.maze_map
     maze_type = env.unwrapped._maze_type if hasattr(env, 'unwrapped') else env._maze_type
@@ -613,6 +612,8 @@ def _create_goal_visualization(
             row = np.concatenate(processed_goals[r * n_cols:(r + 1) * n_cols], axis=1)
             rows.append(row)
         combined = np.concatenate(rows, axis=0)
+    else:
+        raise NotImplementedError(layout)
 
     # Resize to target dimensions if requested
     if resize_goals:
