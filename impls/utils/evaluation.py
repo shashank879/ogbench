@@ -1,4 +1,5 @@
 from collections import defaultdict
+import inspect
 
 import jax
 import numpy as np
@@ -72,13 +73,17 @@ def evaluate(
         should_render = i >= num_eval_episodes
 
         observation, info = env.reset(options=dict(task_id=task_id, render_goal=should_render))
+        first_obs = observation
         goal = info.get('goal')
         goal_frame = info.get('goal_rendered')
         done = False
         step = 0
         render = []
         while not done:
-            action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
+            inputs = dict(observations=observation, goals=goal, temperature=eval_temperature)
+            if 'init_obs' in inspect.signature(agent.sample_actions).parameters:
+                inputs['init_obs'] = first_obs
+            action = actor_fn(**inputs)
             action_info = None
             if isinstance(action, tuple):
                 action, action_info = action
@@ -109,6 +114,8 @@ def evaluate(
                 goal=goal,
                 goal_frame=goal_frame,
             )
+            if 'init_obs' in inspect.signature(agent.sample_actions).parameters:
+                transition['init_obs'] = first_obs
             if action_info:
                 transition.update(action_info)
 
