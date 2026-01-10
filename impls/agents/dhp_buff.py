@@ -31,6 +31,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         if self.config['merge_type'] == 'min':
             return jnp.minimum(left, right)
         elif self.config['merge_type'] == 'prod':
+            assert not self.config['gc_negative'], 'GC negative must be False when merge_type==prod'
             return left * right
         else:
             raise NotImplementedError(self.config.merge_type)
@@ -691,7 +692,7 @@ def get_config():
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             hierarchical_planner=True,
-            reachable_thresh_val=-2,
+            reachable_thresh_val=-1.5,
             hierplan_depth=8,
             high_act_val_fn='high_value',  # [high_value, low_value]
 
