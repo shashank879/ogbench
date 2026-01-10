@@ -1,6 +1,12 @@
+import os
 import numpy as np
 import cv2
 import wandb
+import jax.numpy as jnp
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib import patches
 
 
 def visualize_goal_buffer_on_maze(
@@ -646,6 +652,7 @@ def _create_goal_visualization(
 
     return combined
 
+
 def create_goal_trajectory_video(
     trajectories,
     env,
@@ -716,3 +723,164 @@ def create_goal_trajectory_video(
     video_array = video_array.transpose(0, 3, 1, 2)
 
     return wandb.Video(video_array, fps=20, format="mp4")
+
+
+def draw(env, ax=None):
+    if not ax:
+        ax = plt.gca()
+    env_u = env.unwrapped
+    S = env_u._maze_unit
+    for i in range(len(env_u.maze_map)):
+        for j in range(len(env_u.maze_map[0])):
+            struct = env_u.maze_map[i][j]
+            if struct == 1:
+                rect = patches.Rectangle(
+                    (j * S - (env_u._offset_x) - S / 2, i * S - (env_u._offset_y) - S / 2),
+                    S, S, linewidth=1, edgecolor='none', facecolor='grey', alpha=1.0)
+                ax.add_patch(rect)
+
+
+def plot_value_function_grid(agent, agent_name, n_tasks, env, grid_size=100, output_path="value_function.png", draw_maze=True, all_trajs=None):
+    """
+    Plot value function for multiple tasks in a grid of subplots.
+
+    Args:
+        task_ids: list of task IDs or single task ID (for backward compatibility)
+    """
+    # # Handle single task_id for backward compatibility
+    # if not isinstance(task_ids, (list, tuple)):
+    #     task_ids = [task_ids]
+
+    # Determine grid layout (try to make it as square as possible)
+    # n_cols = int(np.ceil(np.sqrt(n_tasks)))
+    # n_rows = int(np.ceil(n_tasks / n_cols))
+    n_cols = n_tasks
+    n_rows = 1
+
+    # Get environment bounds (same for all tasks)
+    _, info = env.reset(options=dict(task_id=1, render_goal=False))
+    env_u = env.unwrapped
+    S = env_u._maze_unit
+
+    x_min, x_max = 0 * S - (env_u._offset_x) - S / 2, len(env_u.maze_map[0]) * S - (env_u._offset_x) - S / 2
+    y_min, y_max = 0 * S - (env_u._offset_y) - S / 2, len(env_u.maze_map) * S - (env_u._offset_y) - S / 2
+    x_values = np.linspace(x_min, x_max, grid_size)
+    y_values = np.linspace(y_min, y_max, grid_size)
+    X, Y = np.meshgrid(x_values, y_values)
+    positions = np.stack([X.ravel(), Y.ravel()], axis=1)
+
+    # Create figure with subplots
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 6 * n_rows), gridspec_kw={'wspace': 0.05, 'hspace': 0.2})
+    if n_tasks == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    # Store all value grids to determine global vmin/vmax
+    all_value_grids = []
+    all_goals = []
+
+    # Compute value functions for all tasks
+    for task_id in range(1, 1+n_tasks):
+        init_obs, info = env.reset(options=dict(task_id=task_id, render_goal=False))
+        goal = info.get('goal')
+        if all_trajs and 'init_obs' in all_trajs[task_id-1][0]:
+            goal = init_obs
+        all_goals.append(goal)
+
+        # Prepare batched input
+        goal_repeated = np.repeat(goal[2:].reshape(1, -1), positions.shape[0], axis=0)
+        batch_input = np.hstack([positions, goal_repeated])
+        batch_goal = np.repeat(goal.reshape(1, -1), positions.shape[0], axis=0)
+
+        # Compute value function
+        if agent_name in ['qrl']:
+            value_net = agent.network.select('value')
+            value_function_output = -value_net(batch_input, batch_goal)
+        elif agent_name in ['gcivl', 'hiql', 'pi_hiql']:
+            value_net = agent.network.select('value')
+            v1, v2 = value_net(batch_input, batch_goal)
+            value_function_output = (v1 + v2) / 2
+        elif agent_name in ['crl', 'gciql']:
+            dist = agent.network.select('actor')(batch_input, batch_goal)
+            actions = jnp.clip(dist.mode(), -1, 1)
+            q1, q2 = agent.network.select('critic')(batch_input, batch_goal, actions)
+            value_function_output = (q1 + q2) / 2
+        elif 'dhp' in agent_name:
+            value_net = agent.network.select(agent.config['high_act_val_fn'])
+            value_function_output = value_net(batch_input, batch_goal).mean(0)
+
+        value_function_grid = value_function_output.reshape(grid_size, grid_size)
+        all_value_grids.append(value_function_grid)
+
+    # Determine global color scale
+    vmin = min(grid.min() for grid in all_value_grids)
+    vmax = max(grid.max() for grid in all_value_grids)
+
+    # Plot each task
+    for idx, (task_id, value_grid, goal) in enumerate(zip(range(1, 1+n_tasks), all_value_grids, all_goals)):
+        ax = axes[idx]
+
+        # Plot value function
+        im = ax.imshow(value_grid, extent=[x_min, x_max, y_min, y_max], 
+                      origin='lower', cmap='plasma', vmin=vmin, vmax=vmax, zorder=1)
+
+        # Add contour lines
+        contour_levels = np.linspace(value_grid.min(), value_grid.max(), 50)
+        ax.contour(X, Y, value_grid, levels=contour_levels, colors='black', linewidths=0.5, zorder=2)
+
+        # Draw maze
+        if draw_maze:
+            draw(env, ax)
+            for patch in ax.patches:
+                patch.set_zorder(3)
+
+        ax.axis('off')
+
+        # Mark goal
+        goal_position = goal[:2]
+        ax.plot(goal_position[0], goal_position[1], 'ro', markersize=5, label='Goal', zorder=4)
+
+        ax.set_title(f"Task {task_id}")
+
+        if all_trajs is not None and idx < len(all_trajs):
+            task_trajs = all_trajs[idx]
+            for ep_idx, episode in enumerate(task_trajs):
+                observations = np.array(episode['observation'])
+                # Extract x, y positions (assuming first 2 dimensions are x, y)
+                traj_x = observations[:, 0]
+                traj_y = observations[:, 1]
+                
+                # Plot trajectory with transparency
+                alpha = 0.6 if len(task_trajs) > 1 else 0.8
+                ax.plot(traj_x, traj_y, 'g-', alpha=alpha, linewidth=1., zorder=5)
+                
+                # Mark start position
+                if ep_idx == 0:  # Only add to legend once
+                    ax.plot(traj_x[0], traj_y[0], 'gs', markersize=5, label='Start', zorder=6)
+                else:
+                    ax.plot(traj_x[0], traj_y[0], 'gs', markersize=5, zorder=6)
+
+    # Hide unused subplots
+    for idx in range(n_tasks, len(axes)):
+        axes[idx].axis('off')
+
+    # Add shared colorbar
+    fig.subplots_adjust(right=0.9)
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    cbar = fig.colorbar(im, cax=cbar_ax, label='Value (Goal-Conditioned)')
+
+    # Add shared legend
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=len(labels), bbox_to_anchor=(0.5, 0.02), frameon=False, markerscale=0.8)
+
+    # Save figure
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1)
+
+    # Convert to array
+    fig.canvas.draw()
+    img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
+    plt.close()
+
+    return img_array
