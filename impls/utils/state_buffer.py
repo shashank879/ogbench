@@ -173,7 +173,7 @@ class GoalBuffer:
 
         return pairwise_distances
 
-    def retrieve_nearest_embedding(self, goal_emb_query=None, goal_rep_query=None, current_state=None, goal_rep_fn=None):
+    def retrieve_nearest_embedding(self, goal_emb_query=None, goal_rep_query=None, current_state=None, goal_rep_fn=None, use_cosine=True):
         """Retrieve observation nearest to query embedding.
 
         Args:
@@ -192,15 +192,22 @@ class GoalBuffer:
             # Value-weighted retrieval: balance distance and reachability
             current_state_expanded = jnp.broadcast_to(current_state[None], (len(self.goal_observations), *current_state.shape))
             pred_goal_rep = jax.vmap(goal_rep_fn)(current_state_expanded, observations_array)
-            distances = jnp.linalg.norm(goal_rep_query - pred_goal_rep, axis=1)
-            best_idx = distances.argmin()
+            if use_cosine:
+                # Cosine distance: 1 - cosine_similarity
+                # cosine_sim = (a · b) / (||a|| * ||b||)
+                query_norm = jnp.linalg.norm(goal_rep_query)
+                pred_norms = jnp.linalg.norm(pred_goal_rep, axis=1)
+                dot_products = jnp.dot(pred_goal_rep, goal_rep_query)
+                cosine_sim = dot_products / (query_norm * pred_norms + 1e-8)
+                distances = 1 - cosine_sim
+            else:
+                distances = jnp.linalg.norm(goal_rep_query - pred_goal_rep, axis=1)
         else:
             embeddings_array = jnp.stack(self.goal_embeddings)
             # Compute distances in embedding space (vectorized)
             distances = jnp.linalg.norm(embeddings_array - goal_emb_query, axis=1)
-            # Pure nearest neighbor in embedding space
-            best_idx = distances.argmin()
 
+        best_idx = distances.argmin()
         # Use JAX indexing to retrieve the observation (JIT-compatible)
         return observations_array[best_idx]
 
