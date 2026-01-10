@@ -34,6 +34,7 @@ flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
+flags.DEFINE_string('best_metric_key', 'evaluation/overall_success', 'Saving interval.')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
@@ -101,6 +102,7 @@ def main(_):
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
     first_time = time.time()
     last_time = time.time()
+    best_metric = None
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
@@ -202,6 +204,10 @@ def main(_):
             if not FLAGS.debug:
                 wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)
+
+            if (best_metric is None) or (eval_metrics['evaluation/overall_success'] >= best_metric):
+                save_agent(agent, FLAGS.save_dir, 'best')
+                best_metric = eval_metrics['evaluation/overall_success']
 
         # Save agent.
         if i % FLAGS.save_interval == 0:
