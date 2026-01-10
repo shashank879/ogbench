@@ -282,16 +282,17 @@ class GCValue(nn.Module):
     layer_norm: bool = True
     ensemble: bool = True
     gc_encoder: nn.Module = None
+    num_ensembles: int = 2
 
     def setup(self):
         mlp_module = MLP
         if self.ensemble:
-            mlp_module = ensemblize(mlp_module, 2)
+            mlp_module = ensemblize(mlp_module, self.num_ensembles)
         value_net = mlp_module((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)
 
         self.value_net = value_net
 
-    def __call__(self, observations, goals=None, actions=None):
+    def __call__(self, observations, goals=None, actions=None, obs_encoded=False, goal_encoded=False):
         """Return the value/critic function.
 
         Args:
@@ -300,7 +301,7 @@ class GCValue(nn.Module):
             actions: Actions (optional).
         """
         if self.gc_encoder is not None:
-            inputs = [self.gc_encoder(observations, goals)]
+            inputs = [self.gc_encoder(observations, goals, obs_encoded=obs_encoded, goal_encoded=goal_encoded)]
         else:
             inputs = [observations]
             if goals is not None:

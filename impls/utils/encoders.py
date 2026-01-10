@@ -113,7 +113,7 @@ class GCEncoder(nn.Module):
     concat_encoder: nn.Module = None
 
     @nn.compact
-    def __call__(self, observations, goals=None, goal_encoded=False):
+    def __call__(self, observations, goals=None, obs_encoded=False, goal_encoded=False):
         """Returns the representations of observations and goals.
 
         If `goal_encoded` is True, `goals` is assumed to be already encoded representations. In this case, either
@@ -121,7 +121,10 @@ class GCEncoder(nn.Module):
         """
         reps = []
         if self.state_encoder is not None:
-            reps.append(self.state_encoder(observations))
+            if obs_encoded:
+                reps.append(observations)
+            else:
+                reps.append(self.state_encoder(observations))
         if goals is not None:
             if goal_encoded:
                 # Can't have both goal_encoder and concat_encoder in this case.
