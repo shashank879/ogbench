@@ -12,10 +12,11 @@ import wandb
 from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
-from utils.datasets import Dataset, GCDataset, HGCDataset, DHPDataset
+from utils.datasets import Dataset, GCDataset, HGCDataset, DHPDataset, ReplayBuffer, MixedDataset
 from utils.env_utils import make_env_and_datasets
-from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video
+from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video, plot_value_function_grid
 from utils.evaluation import evaluate
+from utils.exploration import collect_exploration_episodes
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from PIL import Image
@@ -45,6 +46,17 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 flags.DEFINE_boolean('debug', False, 'Run in debug mode.')
 
+# Exploration flags
+flags.DEFINE_enum('exploration_mode', 'none', ['none', 'pretrain', 'interleaved'], 'Exploration mode: none (offline only), pretrain (explore then train), interleaved (explore during training)')
+flags.DEFINE_integer('exploration_episodes', 10, 'Number of exploration episodes (for pretrain mode)')
+flags.DEFINE_integer('exploration_interval', 5000, 'Exploration interval in training steps (for interleaved mode)')
+flags.DEFINE_integer('replay_buffer_size', 1000000, 'Size of online replay buffer')
+flags.DEFINE_float('offline_online_ratio', 0.5, 'Ratio of offline to online data (0.5 = 50% offline, 50% online). 1.0 = only offline, 0.0 = only online')
+flags.DEFINE_float('exploration_temperature', 1.0, 'Temperature for exploration policy')
+flags.DEFINE_float('exploration_gaussian', None, 'Gaussian noise std for exploration')
+# flags.DEFINE_boolean('init_buffer_with_offline', False, 'Initialize replay buffer with offline dataset')
+flags.DEFINE_integer('exploration_max_steps', 1000, 'Max steps per exploration episode')
+
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
 
@@ -72,15 +84,39 @@ def main(_):
         'HGCDataset': HGCDataset,
         'DHPDataset': DHPDataset,
     }[config['dataset_class']]
-    train_dataset = dataset_class(Dataset.create(**train_dataset), config)
+
+    # Create offline dataset wrapper
+    offline_dataset: Dataset = Dataset.create(**train_dataset)
+    print('Offline dataset size: ', offline_dataset.size)
     if val_dataset is not None:
         val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+
+    if FLAGS.exploration_mode != 'none' and FLAGS.offline_online_ratio < 1.:
+        example_transition = {k: v[0] for k,v in offline_dataset.sample(1).items()}
+        replay_buffer = ReplayBuffer.create(example_transition, FLAGS.replay_buffer_size)
+        print(f'[REPLAY BUFFER] Created empty buffer of capacity {FLAGS.replay_buffer_size}, and current size {replay_buffer.size}')
+
+        if FLAGS.offline_online_ratio == .0:
+            train_datastore = replay_buffer
+            print('Using only replay buffer')
+        else:
+            train_datastore = MixedDataset.create(
+                datasets=[offline_dataset, replay_buffer],
+                ratios=[FLAGS.offline_online_ratio, 1.0 - FLAGS.offline_online_ratio]
+            )
+            print(f'[DATASET] Using mixed dataset: {FLAGS.offline_online_ratio:.1%} offline, {1-FLAGS.offline_online_ratio:.1%} online')
+    else:
+        train_datastore = offline_dataset
+        print(f'[DATASET] Using 100% offline data')
+
+    # Create GCDataset wrapper once - it will auto-update when underlying data changes
+    train_dataset: GCDataset = dataset_class(train_datastore, config)
+    print(f'[DATASET] Initial size: {train_dataset.size}')
 
     # Initialize agent.
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
-
-    example_batch = train_dataset.sample(1)
+    example_batch = dataset_class(offline_dataset, config).sample(1)
     if config['discrete']:
         # Fill with the maximum action to let the agent know the action space size.
         example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
@@ -100,10 +136,50 @@ def main(_):
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
+    exploration_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'exploration.csv'))
+
     first_time = time.time()
     last_time = time.time()
     best_metric = None
+    total_exploration_episodes = 0
+    task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
+    num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
+
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        # INTERLEAVED EXPLORATION: Collect data during training
+        if FLAGS.exploration_mode != 'none' and (i==1 or i % FLAGS.exploration_interval == 0):
+            print(f'\n[EXPLORATION] Collecting {FLAGS.exploration_episodes} episodes at step {i}...')
+            episodes, returns, lengths = collect_exploration_episodes(
+                agent=agent,
+                env=env,
+                num_episodes=FLAGS.exploration_episodes,
+                config=config,
+                temperature=FLAGS.exploration_temperature,
+                gaussian_noise=FLAGS.exploration_gaussian,
+                max_steps=FLAGS.exploration_max_steps
+            )
+
+            # Add episodes to buffer (no need to recreate datasets!)
+            for episode in episodes:
+                replay_buffer.add_episode(episode)
+
+            total_exploration_episodes += FLAGS.exploration_episodes
+
+            exploration_metrics = {
+                'exploration/mean_return': np.mean(returns),
+                'exploration/mean_length': np.mean(lengths),
+                'exploration/total_episodes': total_exploration_episodes,
+                'buffer/train_dataset_size': train_dataset.size,  # This will show the updated size,
+                'buffer/offline_size': offline_dataset.size,
+                'buffer/online_size': replay_buffer.size,
+            }
+
+            if not FLAGS.debug:
+                wandb.log(exploration_metrics, step=i)
+            exploration_logger.log(exploration_metrics, step=i)
+
+            print(f'[EXPLORATION] Mean return: {np.mean(returns):.2f}, Buffer size: {replay_buffer.size}, Dataset size: {train_dataset.size}')
+
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
         agent, update_info = agent.update(batch)
@@ -112,7 +188,7 @@ def main(_):
             update_info.update(non_jit_update_info)
 
         # Log metrics.
-        if i % FLAGS.log_interval == 0:
+        if i==1 or i % FLAGS.log_interval == 0:
             if i > 1:
                 train_metrics = {f'training/{k}': v for k, v in update_info.items()}
                 if val_dataset is not None:
@@ -140,6 +216,16 @@ def main(_):
                 os.makedirs(viz_dir, exist_ok=True)
                 Image.fromarray(buffer_frame).save(os.path.join(viz_dir, f'step_{i}.png'))
 
+            val_image = plot_value_function_grid(
+                agent=agent,
+                agent_name = config['agent_name'],
+                n_tasks=num_tasks,
+                env=env,
+                grid_size=100,
+                output_path=os.path.join(FLAGS.save_dir, 'value_func_image', f'step_{i}.png')
+            )
+            train_metrics['val_image'] = wandb.Image(val_image)
+
             if not FLAGS.debug:
                 wandb.log(train_metrics, step=i)
             train_logger.log(train_metrics, step=i)
@@ -153,9 +239,8 @@ def main(_):
             renders = []
             eval_metrics = {}
             overall_metrics = defaultdict(list)
+            all_trajs = []
             render_trajs = []
-            task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
-            num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
             for task_id in tqdm.trange(1, num_tasks + 1):
                 task_name = task_infos[task_id - 1]['task_name']
                 eval_info, trajs, cur_renders, cur_render_trajs = evaluate(
@@ -169,6 +254,7 @@ def main(_):
                     eval_temperature=FLAGS.eval_temperature,
                     eval_gaussian=FLAGS.eval_gaussian,
                 )
+                all_trajs.append(trajs)
                 renders.extend(cur_renders)
                 render_trajs.extend(cur_render_trajs)
                 metric_names = ['success']
@@ -180,6 +266,17 @@ def main(_):
                         overall_metrics[k].append(v)
             for k, v in overall_metrics.items():
                 eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
+            
+            val_image = plot_value_function_grid(
+                agent=agent,
+                agent_name = config['agent_name'],
+                n_tasks=num_tasks,
+                env=env,
+                grid_size=100,
+                output_path=os.path.join(FLAGS.save_dir, 'eval_value_func_image', f'step_{i}.png'),
+                all_trajs=all_trajs,
+            )
+            eval_metrics['inf_value_image'] = wandb.Image(val_image)
 
             if FLAGS.video_episodes > 0:
                 if not FLAGS.debug:
@@ -215,6 +312,7 @@ def main(_):
 
     train_logger.close()
     eval_logger.close()
+    exploration_logger.close()
 
 
 if __name__ == '__main__':
