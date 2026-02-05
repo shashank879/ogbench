@@ -297,13 +297,12 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
 
         loss = low_value_loss + high_value_loss + low_actor_loss + high_actor_loss
 
-        # # Add decoder loss if enabled
-        # if self.config['use_goal_decoder'] and self.config['decoder_weight']:
-        #     decoder_loss, decoder_info = self.decoder_loss(batch, grad_params)
-        #     for k, v in decoder_info.items():
-        #         info[f'decoder/{k}'] = v
-
-        #     loss = loss + self.config['decoder_weight'] * decoder_loss
+        # Add decoder loss if enabled
+        if self.config['use_goal_decoder']:
+            decoder_loss, decoder_info = self.decoder_loss(batch, grad_params)
+            for k, v in decoder_info.items():
+                info[f'decoder/{k}'] = v
+            loss = loss + decoder_loss
 
         return loss, info
 
@@ -359,7 +358,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         update = (not self.goal_buffer.is_full()) or (step % self.config['buffer_update_freq'] == 0)
 
         # Update goal buffer if enabled
-        if update and (self.goal_buffer is not None and self.config['use_goal_decoder']):
+        if update:
             # Add to buffer
             added_count = self.goal_buffer.add_batch(
                 batch['low_value_goals'],
@@ -417,12 +416,6 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         info = {}
         high_seed, low_seed = jax.random.split(seed)
 
-        # # Get current state embedding from value function's encoder
-        # if self.config['encoder'] is not None:
-        #     emb_s = self.network.select('state_encoder')(observations)
-        # else:
-        #     emb_s = observations
-
         def sample_subgoal(carry, _):
             """Sample one subgoal level."""
             current_goal = carry['goal']
@@ -430,10 +423,6 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             high_dist = self.network.select('high_actor')(observations, current_goal, temperature=temperature)
             goal_reps = high_dist.sample(seed=high_seed)
             goal_reps = goal_reps / jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) * jnp.sqrt(goal_reps.shape[-1])
-
-            # Decode goal_rep to embedding space
-            # decoder_input = jnp.concatenate([goal_reps, emb_s], axis=-1)
-            # emb_g_decoded = self.network.select('goal_decoder')(decoder_input)
 
             # Retrieve nearest goal from buffer
             retrieved_goal = self.goal_buffer.retrieve_nearest_embedding(
@@ -448,19 +437,18 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             next_carry = {
                 'goal': retrieved_goal,
             }
-            return next_carry, (retrieved_goal)
+            return next_carry, (retrieved_goal, goal_reps)
 
         init_carry = {
             'goal': goals,
         }
-        _, (subgoals) = jax.lax.scan(
+        _, (subgoals, subgoal_reps) = jax.lax.scan(
             sample_subgoal,
             init_carry,
             jnp.arange(self.config['hierplan_depth'])
         )
 
         subgoals = jnp.concatenate([goals[None], subgoals], axis=0)  # Shape: (depth+1, obs_dim)
-        # dec_goal_emb = jnp.concatenate([goals[None], dec_goal_emb], axis=0)  # Shape: (depth+1, obs_dim)
         low_value_pred = self.network.select('low_value')(jnp.stack([observations] * subgoals.shape[0], 0), subgoals).mean(0)  # Shape: (depth+1,)
         reachable = self.low_actor_val_norm.normalize(low_value_pred) >= self.config['reachable_thresh_val']
         cont = jax.lax.cumprod(1 - reachable, axis=0)  # Shape: (depth+1,)
@@ -477,8 +465,20 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         first_subgoal = jnp.sum(jnp.expand_dims(first_reach, [i+1 for i in range(len(subgoals.shape) - len(first_reach.shape))]) * subgoals, axis=0)
 
         info['subgoals'] = subgoals
-        # info['decoded_subgoals'] = dec_goal_emb
         info['subgoal_first_reach_index'] = first_reach_index
+
+        # Only for visualization
+        if self.config['use_goal_decoder']:
+            # Get current state embedding from value function's encoder
+            if self.config['encoder'] is not None:
+                emb_s = self.network.select('state_encoder')(observations)
+            else:
+                emb_s = observations
+            decoder_input = jnp.concatenate([subgoal_reps, jnp.broadcast_to(emb_s[None], (subgoal_reps.shape[0], *emb_s.shape))], axis=-1)
+            emb_g_decoded = self.network.select('goal_decoder')(decoder_input)
+            # Add visual decoder here to support visual decoded subgoals
+            dec_goal_emb = jnp.concatenate([goals[None], emb_g_decoded], axis=0)  # Shape: (depth+1, obs_dim)
+            info['decoded_subgoals'] = dec_goal_emb
 
         low_dist = self.network.select('low_actor')(observations, first_subgoal, temperature=temperature)
         actions = low_dist.sample(seed=low_seed)
@@ -529,7 +529,8 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         goal_rep_def = nn.Sequential(goal_rep_seq)
 
         # Define goal decoder: [goal_rep; emb_s] -> emb_g
-        if config.get('use_goal_decoder', False):
+        if config['use_goal_decoder']:
+            assert config['encoder'] is None, 'Presently decoder is not supported with pixel obs'
             if config['encoder'] is not None:
                 # For pixel-based: need to determine encoder output dimension
                 encoder_output_dim = goal_rep_seq[0].mlp_hidden_dims[-1]
@@ -640,11 +641,11 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             high_actor=(high_actor_def, (ex_observations, ex_goals)),
         )
 
-        # # Add decoder if enabled
-        # if config.get('use_goal_decoder', False):
-        #     ex_dec_input = jnp.zeros((1, decoder_input_dim))
-        #     network_info['goal_decoder'] = (goal_decoder_def, (ex_dec_input,))
-        #     network_info['state_encoder'] = (low_value_encoder_def.state_encoder, (ex_observations,))
+        # Add decoder if enabled
+        if config['use_goal_decoder']:
+            ex_dec_input = jnp.zeros((1, decoder_input_dim))
+            network_info['goal_decoder'] = (goal_decoder_def, (ex_dec_input,))
+            network_info['state_encoder'] = (low_value_encoder_def.state_encoder, (ex_observations,))
 
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -658,13 +659,11 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         params['modules_target_low_value'] = params['modules_low_value']
         params['modules_target_high_value'] = params['modules_high_value']
 
-        # Initialize goal buffer if decoder is enabled
-        goal_buffer = None
-        if config.get('use_goal_decoder', False):
-            goal_buffer = GoalBuffer(
-                capacity=config['goal_buffer_capacity'],
-                reference_state=ex_observations[0],
-            )
+        # Initialize goal buffer
+        goal_buffer = GoalBuffer(
+            capacity=config['goal_buffer_capacity'],
+            reference_state=ex_observations[0],
+        )
 
         return cls(rng, network=network, goal_buffer=goal_buffer, low_actor_val_norm=RunningMeanStd(), config=flax.core.FrozenDict(**config))
 
@@ -697,8 +696,7 @@ def get_config():
             high_act_val_fn='high_value',  # [high_value, low_value]
 
             # Goal buffer hyperparameters
-            use_goal_decoder=True,  # Whether to use goal decoder and buffer
-            decoder_weight=0.1,  # Weight for decoder loss
+            use_goal_decoder=True,  # Whether to use goal decoder (only for visualizations)
             decoder_inv_loss=False,
             goal_buffer_capacity=2048,  # Buffer size
             goal_buffer_diversity=0.5,  # Diversity threshold in embedding space
