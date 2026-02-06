@@ -32,7 +32,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         else:
             raise NotImplementedError(self.config.merge_type)
 
-    def low_value_loss(self, batch, grad_params):
+    def seq_value_loss(self, batch, grad_params):
         """Compute the IVL value loss.
 
         This value loss is similar to the original IQL value loss, but involves additional tricks to stabilize training.
@@ -41,18 +41,17 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         compute the former and the current value function to compute the latter. This is similar to how double DQN
         mitigates overestimation bias.
         """
-        next_v_ts = self.network.select('target_low_value')(batch['next_observations'], batch['low_value_goals'])
+        next_v_ts = self.network.select('target_low_value')(batch['next_observations'], batch['seq_value_goals'])
         next_v_t = next_v_ts.min(0)
-        q_mean = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v_t
+        q_mean = batch['seq_rewards'] + self.config['discount'] * batch['seq_masks'] * next_v_t
 
-        v_ts = self.network.select('target_low_value')(batch['observations'], batch['low_value_goals'])
+        v_ts = self.network.select('target_low_value')(batch['observations'], batch['seq_value_goals'])
         v_t = v_ts.mean(0)
         adv = q_mean - v_t
 
-        qs = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v_ts
-        vs = self.network.select('low_value')(batch['observations'], batch['low_value_goals'], params=grad_params)
+        qs = batch['seq_rewards'] + self.config['discount'] * batch['seq_masks'] * next_v_ts
+        vs = self.network.select('low_value')(batch['observations'], batch['seq_value_goals'], params=grad_params)
         v = vs.mean(0)
-
 
         value_losses = self.expectile_loss(adv[None], qs - vs, self.config['expectile']).sum(0)
         value_loss = value_losses.mean()
@@ -64,7 +63,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             'v_min': v.min(),
         }
 
-    def high_value_loss(self, batch, grad_params):
+    def hier_value_loss(self, batch, grad_params):
         """Compute the IVL value loss.
 
         This value loss is similar to the original IQL value loss, but involves additional tricks to stabilize training.
@@ -73,15 +72,15 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         compute the former and the current value function to compute the latter. This is similar to how double DQN
         mitigates overestimation bias.
         """
-        left_next_v_ts = self.network.select('target_high_value')(batch['observations'], batch['high_value_subgoals'])
-        right_next_v_ts = self.network.select('target_high_value')(batch['high_value_subgoals'], batch['high_value_goals'])
+        left_next_v_ts = self.network.select('target_high_value')(batch['observations'], batch['hier_value_subgoals'])
+        right_next_v_ts = self.network.select('target_high_value')(batch['hier_value_subgoals'], batch['hier_value_goals'])
         left_next_v_t = left_next_v_ts.min(0)
         right_next_v_t = right_next_v_ts.min(0)
         q_mean = self.merge_op(
             batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v_t,
             batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v_t)
 
-        v_ts = self.network.select('target_high_value')(batch['observations'], batch['high_value_goals'])
+        v_ts = self.network.select('target_high_value')(batch['observations'], batch['hier_value_goals'])
         v_t = v_ts.mean(0)
         adv = q_mean - v_t
 
@@ -89,7 +88,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         right_qs = batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v_ts
         qs = self.merge_op(left_qs, right_qs)
 
-        vs = self.network.select('high_value')(batch['observations'], batch['high_value_goals'], params=grad_params)
+        vs = self.network.select('high_value')(batch['observations'], batch['hier_value_goals'], params=grad_params)
         v = vs.mean(0)
 
         value_losses = self.expectile_loss(adv[None], qs - vs, self.config['expectile']).sum(0)
@@ -210,11 +209,11 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         """Compute the total loss."""
         info = {}
 
-        low_value_loss, low_value_info = self.low_value_loss(batch, grad_params)
+        low_value_loss, low_value_info = self.seq_value_loss(batch, grad_params)
         for k, v in low_value_info.items():
             info[f'low_value/{k}'] = v
 
-        high_value_loss, high_value_info = self.high_value_loss(batch, grad_params)
+        high_value_loss, high_value_info = self.hier_value_loss(batch, grad_params)
         for k, v in high_value_info.items():
             info[f'high_value/{k}'] = v
 
@@ -464,15 +463,15 @@ def get_config():
             high_act_val_fn='high_value',  # [high_value, low_value]
 
             # Dataset hyperparameters.
-            dataset_class='DHPDataset',  # Dataset class name.
+            dataset_class='DHPExplDataset',  # Dataset class name.
             value_p_curgoal=0.2,  # Probability of using the current state as the value goal.
             value_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the value goal.
             value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
             value_geom_sample=True,  # Whether to use geometric sampling for future value goals.
-            high_value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
-            high_value_p_trajgoal=0.7,  # Probability of using a future state in the same trajectory as the value goal.
-            high_value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
-            high_value_normal_subg_sample=False,  # Whether to use geometric sampling for future value goals.
+            hier_value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
+            hier_value_p_trajgoal=0.7,  # Probability of using a future state in the same trajectory as the value goal.
+            hier_value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
+            hier_value_normal_subg_sample=False,  # Whether to use geometric sampling for future value goals.
             # high_value_min_dist=1,
             merge_type='min',
             actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
