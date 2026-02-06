@@ -342,6 +342,203 @@ class ReplayBuffer(Dataset):
         }
 
 
+class MixedDataset:
+    """
+    Optimized Dataset that mixes multiple datasets with specified ratios.
+    """
+
+    @classmethod
+    def create(cls, datasets: list[Dataset], ratios: list[float], freeze=True):
+        """Create a mixed dataset from multiple Dataset objects."""
+        assert len(datasets) == len(ratios), "Number of datasets must match number of ratios"
+        assert np.isclose(sum(ratios), 1.0), f"Ratios must sum to 1.0, got {sum(ratios)}"
+        assert all(r >= 0 for r in ratios), "All ratios must be non-negative"
+        assert len(datasets) > 0, "Must provide at least one dataset"
+
+        # Get keys from first dataset
+        first_ds = datasets[0]
+        initial_dict = {key: np.array([]) for key in first_ds._dict.keys()}
+
+        # Create instance
+        instance = super(MixedDataset, cls).__new__(cls)
+        FrozenDict.__init__(instance, initial_dict)
+
+        # Store attributes
+        instance.datasets = datasets
+        instance.ratios = ratios
+        instance.num_datasets = len(datasets)
+        instance._cache = {}
+        instance._cached_size = 0
+        instance._cached_cumsum = None  # NEW: Cache cumulative sizes
+
+        # Compute initial size
+        instance._size = sum(ds.size for ds in datasets)
+
+        # Compute valid_idxs if any dataset has valids
+        if any('valids' in ds._dict for ds in datasets):
+            instance._recompute_valid_idxs()
+        else:
+            instance.valid_idxs = None
+
+        return instance
+
+    def _recompute_valid_idxs(self):
+        """Recompute valid indices from all datasets."""
+        valid_idxs_list = []
+        cumsum = self._get_cumulative_sizes()  # Use cached version
+
+        for i, ds in enumerate(self.datasets):
+            offset = cumsum[i]
+            if hasattr(ds, 'valid_idxs') and ds.valid_idxs is not None:
+                valid_idxs_list.append(ds.valid_idxs + offset)
+            elif 'valids' in ds._dict:
+                (local_valid,) = np.nonzero(ds['valids'][:ds.size] > 0)
+                valid_idxs_list.append(local_valid + offset)
+            else:
+                valid_idxs_list.append(np.arange(ds.size) + offset)
+
+        self.valid_idxs = np.concatenate(valid_idxs_list) if valid_idxs_list else None
+
+    def _get_cumulative_sizes(self):
+        """Get cumulative sizes with caching."""
+        current_size = sum(ds.size for ds in self.datasets)
+
+        # Invalidate cache if size changed
+        if self._cached_cumsum is None or current_size != self._cached_size:
+            sizes = [ds.size for ds in self.datasets]
+            self._cached_cumsum = np.cumsum([0] + sizes)
+            self._cached_size = current_size
+
+        return self._cached_cumsum
+
+    def __getitem__(self, key):
+        """Override to provide lazy concatenation with caching."""
+        current_size = self.size
+
+        # Invalidate cache if dataset size changed
+        if current_size != self._cached_size:
+            self._cache.clear()
+            self._cached_cumsum = None  # Invalidate cumsum cache
+            self._cached_size = current_size
+
+            # Recompute valid_idxs if valids exist
+            if any('valids' in ds._dict for ds in self.datasets):
+                self._recompute_valid_idxs()
+
+        # Return cached if available
+        if key in self._cache:
+            return self._cache[key]
+
+        # Concatenate from all datasets
+        arrays = []
+        for ds in self.datasets:
+            if ds.size > 0:
+                arrays.append(ds._dict[key][:ds.size])
+
+        if not arrays:
+            raise KeyError(f"Key '{key}' not found or all datasets empty")
+
+        result = np.concatenate(arrays)
+        self._cache[key] = result
+        return result
+
+    @property
+    def size(self):
+        """Dynamically compute total size from current dataset sizes."""
+        self._size = sum(ds.size for ds in self.datasets)
+        return self._size
+
+    @property
+    def dataset_sizes(self):
+        """Dynamically get current sizes of all datasets."""
+        return [ds.size for ds in self.datasets]
+
+    @property
+    def cumulative_sizes(self):
+        """Dynamically compute cumulative sizes (with caching)."""
+        return self._get_cumulative_sizes()
+
+    def _global_to_local_idx_vectorized(self, global_idxs):
+        """
+        Convert global indices to (dataset_ids, local_idxs) - VECTORIZED.
+
+        This is the key optimization: processes all indices at once.
+        """
+        cumsum = self._get_cumulative_sizes()
+
+        # Vectorized searchsorted - finds which dataset each index belongs to
+        dataset_ids = np.searchsorted(cumsum[1:], global_idxs, side='right')
+
+        # Vectorized subtraction to get local indices
+        local_idxs = global_idxs - cumsum[dataset_ids]
+
+        return dataset_ids, local_idxs
+
+    def get_random_idxs(self, num_idxs):
+        """Return `num_idxs` random indices respecting mixing ratios."""
+        idxs_list = []
+        cumsum = self._get_cumulative_sizes()
+
+        for i, (ds, ratio) in enumerate(zip(self.datasets, self.ratios)):
+            n_samples = int(num_idxs * ratio)
+
+            # Adjust last dataset to ensure exact num_idxs
+            if i == self.num_datasets - 1:
+                n_samples = num_idxs - sum(len(idx) for idx in idxs_list)
+
+            if n_samples > 0 and ds.size > 0:
+                local_idxs = ds.get_random_idxs(n_samples)
+                global_idxs = local_idxs + cumsum[i]
+                idxs_list.append(global_idxs)
+
+        return np.concatenate(idxs_list) if idxs_list else np.array([], dtype=np.int64)
+
+    def sample(self, batch_size: int, idxs=None):
+        """Sample a batch of transitions."""
+        if idxs is None:
+            idxs = self.get_random_idxs(batch_size)
+        return self.get_subset(idxs)
+
+    def get_subset(self, idxs):
+        """
+        Return a subset of the dataset given the indices.
+
+        OPTIMIZED: Uses vectorized operations instead of Python loops.
+        """
+        # Vectorized index mapping - processes all indices at once!
+        dataset_ids, local_idxs = self._global_to_local_idx_vectorized(idxs)
+
+        # Pre-allocate result dictionary
+        result = None
+
+        # Process each dataset
+        for dataset_id in range(self.num_datasets):
+            # Find all indices belonging to this dataset
+            mask = dataset_ids == dataset_id
+
+            if not np.any(mask):
+                continue
+
+            # Get positions in output array
+            positions = np.where(mask)[0]
+            dataset_local_idxs = local_idxs[mask]
+
+            # Sample from this dataset
+            batch = self.datasets[dataset_id].get_subset(dataset_local_idxs)
+
+            # Initialize result on first batch
+            if result is None:
+                result = {}
+                for key, val in batch.items():
+                    shape = (len(idxs),) + val.shape[1:]
+                    result[key] = np.zeros(shape, dtype=val.dtype)
+
+            # Place batch data in correct positions (vectorized assignment)
+            for key, val in batch.items():
+                result[key][positions] = val
+
+        return result
+
 
 @dataclasses.dataclass
 class GCDataset:
