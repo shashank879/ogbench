@@ -12,7 +12,7 @@ import wandb
 from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
-from utils.datasets import Dataset, GCDataset, HGCDataset, DHPDataset, ReplayBuffer, MixedDataset
+from utils.datasets import Dataset, GCDataset, HGCDataset, DHPDataset, DHPExplDataset, ReplayBuffer, MixedDataset
 from utils.env_utils import make_env_and_datasets
 from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video, plot_value_function_grid
 from utils.evaluation import evaluate
@@ -83,6 +83,7 @@ def main(_):
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
         'DHPDataset': DHPDataset,
+        'DHPExplDataset': DHPExplDataset,
     }[config['dataset_class']]
 
     # Create offline dataset wrapper
@@ -106,6 +107,7 @@ def main(_):
             )
             print(f'[DATASET] Using mixed dataset: {FLAGS.offline_online_ratio:.1%} offline, {1-FLAGS.offline_online_ratio:.1%} online')
     else:
+        replay_buffer = None
         train_datastore = offline_dataset
         print(f'[DATASET] Using 100% offline data')
 
@@ -158,27 +160,32 @@ def main(_):
                 gaussian_noise=FLAGS.exploration_gaussian,
                 max_steps=FLAGS.exploration_max_steps
             )
-
-            # Add episodes to buffer (no need to recreate datasets!)
-            for episode in episodes:
-                replay_buffer.add_episode(episode)
-
-            total_exploration_episodes += FLAGS.exploration_episodes
-
             exploration_metrics = {
-                'exploration/mean_return': np.mean(returns),
-                'exploration/mean_length': np.mean(lengths),
-                'exploration/total_episodes': total_exploration_episodes,
-                'buffer/train_dataset_size': train_dataset.size,  # This will show the updated size,
-                'buffer/offline_size': offline_dataset.size,
-                'buffer/online_size': replay_buffer.size,
+                    'exploration/mean_return': np.mean(returns),
+                    'exploration/mean_length': np.mean(lengths),
+                    'exploration/total_episodes': total_exploration_episodes,
             }
+
+            if replay_buffer:
+                # Add episodes to buffer
+                for episode in episodes:
+                    replay_buffer.add_episode(episode, i)
+
+                total_exploration_episodes += FLAGS.exploration_episodes
+
+                recency_stats = replay_buffer.get_recency_stats()
+                exploration_metrics.update({
+                    'buffer/train_dataset_size': train_dataset.size,  # This will show the updated size,
+                    'buffer/offline_size': offline_dataset.size,
+                    'buffer/online_size': replay_buffer.size,
+                    'buffer/num_collection_steps': recency_stats['num_collection_steps'],
+                    'buffer/train_step_range': recency_stats['train_step_range'],
+                    'buffer/oldest_train_step': recency_stats['oldest_train_step'],
+                })
 
             if not FLAGS.debug:
                 wandb.log(exploration_metrics, step=i)
             exploration_logger.log(exploration_metrics, step=i)
-
-            print(f'[EXPLORATION] Mean return: {np.mean(returns):.2f}, Buffer size: {replay_buffer.size}, Dataset size: {train_dataset.size}')
 
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
