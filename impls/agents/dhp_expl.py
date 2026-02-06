@@ -283,92 +283,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             actions = jnp.clip(actions, -1, 1)
         return actions
 
-    def sample_hierarchical_actions(
-        self,
-        observations,
-        goals=None,
-        seed=None,
-        temperature=1.0,
-        use_buffer=True,
-    ):
-        """Sample actions from the actor.
-
-        It first queries the high-level actor to obtain subgoal representations, and then queries the low-level actor
-        to obtain raw actions.
-        """
-        info = {}
-        high_seed, low_seed = jax.random.split(seed)
-
-        # # Get current state embedding from value function's encoder
-        # if self.config['encoder'] is not None:
-        #     emb_s = self.network.select('state_encoder')(observations)
-        # else:
-        #     emb_s = observations
-
-        def sample_subgoal(carry, _):
-            """Sample one subgoal level."""
-            current_goal = carry['goal']
-
-            high_dist = self.network.select('high_actor')(observations, current_goal, temperature=temperature)
-            goal_reps = high_dist.sample(seed=high_seed)
-            goal_reps = goal_reps / jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) * jnp.sqrt(goal_reps.shape[-1])
-
-            # Decode goal_rep to embedding space
-            # decoder_input = jnp.concatenate([goal_reps, emb_s], axis=-1)
-            # emb_g_decoded = self.network.select('goal_decoder')(decoder_input)
-
-            # Retrieve nearest goal from buffer
-            retrieved_goal = self.goal_buffer.retrieve_nearest_embedding(
-                goal_emb_query=None,
-                goal_rep_query=goal_reps,
-                current_state=observations,
-                goal_rep_fn=lambda s,g: self.network.select('goal_rep')(
-                    jnp.concatenate([s, g], axis=-1),
-                ),
-            )
-
-            next_carry = {
-                'goal': retrieved_goal,
-            }
-            return next_carry, (retrieved_goal)
-
-        init_carry = {
-            'goal': goals,
-        }
-        _, (subgoals) = jax.lax.scan(
-            sample_subgoal,
-            init_carry,
-            jnp.arange(self.config['hierplan_depth'])
-        )
-
-        subgoals = jnp.concatenate([goals[None], subgoals], axis=0)  # Shape: (depth+1, obs_dim)
-        # dec_goal_emb = jnp.concatenate([goals[None], dec_goal_emb], axis=0)  # Shape: (depth+1, obs_dim)
-        low_value_pred = self.network.select('low_value')(jnp.stack([observations] * subgoals.shape[0], 0), subgoals).mean(0)  # Shape: (depth+1,)
-        reachable = self.low_actor_val_norm.normalize(low_value_pred) >= self.config['reachable_thresh_val']
-        cont = jax.lax.cumprod(1 - reachable, axis=0)  # Shape: (depth+1,)
-
-        # Mark last subgoal as always reachable (fallback)
-        reach_fb = jnp.concatenate([cont[:-1], jnp.zeros_like(cont[:1])], axis=0)
-        reach_p1 = jnp.concatenate([jnp.ones_like(cont[:1]), cont[:-1]], axis=0)
-
-        # Find first reachable subgoal
-        first_reach = (reach_p1 - reach_fb).astype(jnp.float32)  # Shape: (depth+1,)
-        first_reach_index = jnp.argmax(first_reach, axis=0)  # Scalar
-
-        # Extract first reachable subgoal using weighted sum
-        first_subgoal = jnp.sum(jnp.expand_dims(first_reach, [i+1 for i in range(len(subgoals.shape) - len(first_reach.shape))]) * subgoals, axis=0)
-
-        info['subgoals'] = subgoals
-        # info['decoded_subgoals'] = dec_goal_emb
-        info['subgoal_first_reach_index'] = first_reach_index
-
-        low_dist = self.network.select('low_actor')(observations, first_subgoal, temperature=temperature)
-        actions = low_dist.sample(seed=low_seed)
-
-        if not self.config['discrete']:
-            actions = jnp.clip(actions, -1, 1)
-        return actions, info
-
     @classmethod
     def create(
         cls,
@@ -518,15 +432,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         params['modules_target_low_value'] = params['modules_low_value']
         params['modules_target_high_value'] = params['modules_high_value']
 
-        # Initialize goal buffer if decoder is enabled
-        goal_buffer = None
-        if config.get('use_goal_decoder', False):
-            goal_buffer = GoalBuffer(
-                capacity=config['goal_buffer_capacity'],
-                reference_state=ex_observations[0],
-            )
-
-        return cls(rng, network=network, goal_buffer=goal_buffer, low_actor_val_norm=RunningMeanStd(), config=flax.core.FrozenDict(**config))
+        return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 
 def get_config():
@@ -556,15 +462,6 @@ def get_config():
             reachable_thresh_val=-1.5,
             hierplan_depth=8,
             high_act_val_fn='high_value',  # [high_value, low_value]
-
-            # Goal buffer hyperparameters
-            use_goal_decoder=True,  # Whether to use goal decoder and buffer
-            decoder_weight=0.1,  # Weight for decoder loss
-            decoder_inv_loss=False,
-            goal_buffer_capacity=2048,  # Buffer size
-            goal_buffer_diversity=0.5,  # Diversity threshold in embedding space
-            use_value_retrieval=False,  # Whether to use value-weighted retrieval
-            buffer_update_freq=5000,
 
             # Dataset hyperparameters.
             dataset_class='DHPDataset',  # Dataset class name.
