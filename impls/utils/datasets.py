@@ -563,7 +563,7 @@ class GCDataset:
     - frame_stack: Number of frames to stack.
 
     Attributes:
-        dataset: Dataset object.
+        dataset: Dataset object (can be Dataset, ReplayBuffer, or MixedDataset).
         config: Configuration dictionary.
         preprocess_frame_stack: Whether to preprocess frame stacks. If False, frame stacks are computed on-the-fly. This
             saves memory but may slow down training.
@@ -574,12 +574,8 @@ class GCDataset:
     preprocess_frame_stack: bool = True
 
     def __post_init__(self):
-        self.size = self.dataset.size
-
-        # Pre-compute trajectory boundaries.
-        (self.terminal_locs,) = np.nonzero(self.dataset['terminals'] > 0)
-        self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
-        assert self.terminal_locs[-1] == self.size - 1
+        self._last_known_size = 0
+        self._recompute_trajectory_info()
 
         # Assert probabilities sum to 1.
         assert np.isclose(
@@ -595,6 +591,30 @@ class GCDataset:
             if self.preprocess_frame_stack:
                 stacked_observations = self.get_stacked_observations(np.arange(self.size))
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
+                raise
+
+    @property
+    def size(self):
+        return self.dataset.size
+
+    def _recompute_trajectory_info(self):
+        """Compute trajectory boundaries. Called on init and when dataset size changes."""
+        # print('Computing traj info')
+        (self.terminal_locs,) = np.nonzero(self.dataset['terminals'] > 0)
+        self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
+
+        if len(self.terminal_locs) > 0:
+            assert self.terminal_locs[-1] == self.size - 1, \
+                f"Last terminal should be at index {self.size - 1}, got {self.terminal_locs[-1]}"
+
+        self._last_known_size = self.size
+
+    def _check_and_refresh(self):
+        """Check if dataset size changed and refresh trajectory info if needed."""
+        # TODO: Have a better check cause replay buffer stays same size
+        # current_size = self.dataset.size
+        # if current_size != self._last_known_size:
+        self._recompute_trajectory_info()
 
     def sample(self, batch_size: int, idxs=None, evaluation=False):
         """Sample a batch of transitions with goals.
@@ -608,6 +628,9 @@ class GCDataset:
             idxs: Indices of the transitions to sample. If None, random indices are sampled.
             evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
         """
+        # Check if dataset size changed and refresh if needed
+        self._check_and_refresh()
+
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
 
@@ -721,6 +744,8 @@ class HGCDataset(GCDataset):
             idxs: Indices of the transitions to sample. If None, random indices are sampled.
             evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
         """
+        self._check_and_refresh()
+
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
 
@@ -791,6 +816,7 @@ class HGCDataset(GCDataset):
         return batch
 
 
+@dataclasses.dataclass
 class DHPDataset(HGCDataset):
 
     def sample_low_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, max_distance=None):
@@ -862,6 +888,8 @@ class DHPDataset(HGCDataset):
             idxs: Indices of the transitions to sample. If None, random indices are sampled.
             evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
         """
+        self._check_and_refresh()
+
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
 
