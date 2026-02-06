@@ -91,11 +91,11 @@ class ReplayBuffer(Dataset):
 
     @classmethod
     def create(cls, transition, size):
-        """Create a replay buffer from the example transition.
+        """Create a replay buffer from an example transition.
 
         Args:
-            transition: Example transition (dict).
-            size: Size of the replay buffer.
+            transition: Example transition (dict with scalar values).
+            size: Maximum size of the replay buffer.
         """
 
         def create_buffer(example):
@@ -103,7 +103,32 @@ class ReplayBuffer(Dataset):
             return np.zeros((size, *example.shape), dtype=example.dtype)
 
         buffer_dict = jax.tree_util.tree_map(create_buffer, transition)
-        return cls(buffer_dict)
+
+        # Create instance without calling Dataset.__init__ yet
+        instance = cls.__new__(cls)
+        FrozenDict.__init__(instance, buffer_dict)
+        instance.max_size = size
+        instance.size = 0
+        instance.train_steps = np.zeros(size, dtype=np.int64)
+        instance.use_recency = True
+        instance.recency_strategy = 'windowed_exp'
+        instance.recency_alpha = 1e-5
+        instance.recency_window = 50000
+
+        # Set valid_idxs if valids key exists
+        if 'valids' in buffer_dict:
+            instance.valid_idxs = np.array([], dtype=np.int64)
+
+        return instance
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_size = 0
+        self.train_steps = None
+        self.use_recency = False
+        self.recency_strategy = 'windowed_exp'
+        self.recency_alpha = 1e-5
+        self.recency_window = 50000
 
     @classmethod
     def create_from_initial_dataset(cls, init_dataset, size):
@@ -116,34 +141,206 @@ class ReplayBuffer(Dataset):
 
         def create_buffer(init_buffer):
             buffer = np.zeros((size, *init_buffer.shape[1:]), dtype=init_buffer.dtype)
-            buffer[: len(init_buffer)] = init_buffer
+            init_size = min(len(init_buffer), size)
+            buffer[:init_size] = init_buffer[:init_size]
             return buffer
 
         buffer_dict = jax.tree_util.tree_map(create_buffer, init_dataset)
-        dataset = cls(buffer_dict)
-        dataset.size = dataset.pointer = get_size(init_dataset)
-        return dataset
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        instance = cls.__new__(cls)
+        FrozenDict.__init__(instance, buffer_dict)
+        instance.max_size = size
+        instance.size = min(get_size(init_dataset), size)
+        instance.train_steps = np.zeros(size, dtype=np.int64)
+        instance.use_recency = True
+        instance.recency_strategy = 'windowed_exp'
+        instance.recency_alpha = 1e-5
+        instance.recency_window = 50000
 
-        self.max_size = get_size(self._dict)
-        self.size = 0
-        self.pointer = 0
+        # Set valid_idxs if valids exist
+        if 'valids' in buffer_dict:
+            valids = buffer_dict['valids'][:instance.size]
+            (instance.valid_idxs,) = np.nonzero(valids > 0)
 
-    def add_transition(self, transition):
-        """Add a transition to the replay buffer."""
+        return instance
 
-        def set_idx(buffer, new_element):
-            buffer[self.pointer] = new_element
+    def add_transition(self, transition, train_step=0):
+        """Add a single transition to the buffer."""
+        if self.size < self.max_size:
+            # Buffer not full, just append
+            idx = self.size
+            self.size += 1
+        else:
+            # Buffer full, shift everything left by 1 and add at end
+            for key in self._dict.keys():
+                self._dict[key][:-1] = self._dict[key][1:]
+            self.train_steps[:-1] = self.train_steps[1:]
+            idx = self.size - 1
 
-        jax.tree_util.tree_map(set_idx, self._dict, transition)
-        self.pointer = (self.pointer + 1) % self.max_size
-        self.size = max(self.pointer, self.size)
+        # Write new transition at idx
+        for key, value in transition.items():
+            self._dict[key][idx] = value
+        self.train_steps[idx] = train_step
+
+        # Update valid_idxs if needed
+        if 'valids' in self._dict:
+            valids = self._dict['valids'][:self.size]
+            (self.valid_idxs,) = np.nonzero(valids > 0)
+
+    def add_transitions(self, transitions, train_step=0):
+        """Add multiple transitions to the buffer efficiently."""
+        num_new = len(transitions)
+        if num_new == 0:
+            return
+
+        if self.size + num_new <= self.max_size:
+            # All transitions fit without shifting
+            for i, transition in enumerate(transitions):
+                idx = self.size + i
+                for key, value in transition.items():
+                    self._dict[key][idx] = value
+                self.train_steps[idx] = train_step
+            self.size += num_new
+        else:
+            # Need to shift or replace
+            if num_new >= self.max_size:
+                # New data fills entire buffer, just take last max_size transitions
+                start_idx = num_new - self.max_size
+                for i, transition in enumerate(transitions[start_idx:]):
+                    for key, value in transition.items():
+                        self._dict[key][i] = value
+                    self.train_steps[i] = train_step
+                self.size = self.max_size
+            else:
+                # Shift existing data and add new
+                overflow = (self.size + num_new) - self.max_size
+                # Shift left by overflow
+                for key in self._dict.keys():
+                    self._dict[key][:-overflow] = self._dict[key][overflow:]
+                self.train_steps[:-overflow] = self.train_steps[overflow:]
+                # Add new transitions at end
+                for i, transition in enumerate(transitions):
+                    idx = self.size - overflow + i
+                    for key, value in transition.items():
+                        self._dict[key][idx] = value
+                    self.train_steps[idx] = train_step
+                self.size = self.max_size
+
+        # Update valid_idxs if needed
+        if 'valids' in self._dict:
+            valids = self._dict['valids'][:self.size]
+            (self.valid_idxs,) = np.nonzero(valids > 0)
+
+    def add_episode(self, episode_dict, train_step=0):
+        """Add a complete episode to the buffer."""
+        episode_length = len(episode_dict['observations'])
+        transitions = []
+        for i in range(episode_length):
+            transition = {key: val[i] for key, val in episode_dict.items()}
+            transitions.append(transition)
+        self.add_transitions(transitions, train_step=train_step)
+
+    def get_random_idxs(self, num_idxs):
+        """Return `num_idxs` random indices.
+
+        If use_recency is True, samples with bias toward recent training steps.
+        Otherwise, samples uniformly.
+
+        Args:
+            num_idxs: Number of indices to sample
+
+        Returns:
+            Array of sampled indices
+        """
+        if 'valids' in self._dict:
+            valid_positions = self.valid_idxs
+        else:
+            valid_positions = np.arange(self.size)
+
+        if not self.use_recency or self.size == 0:
+            # Uniform sampling (original behavior)
+            return valid_positions[np.random.randint(len(valid_positions), size=num_idxs)]
+
+        # Recency-weighted sampling
+        # Get train steps for valid positions
+        train_steps_valid = self.train_steps[valid_positions]
+
+        # Find unique train steps and their inverse mapping
+        unique_steps, inverse_indices = np.unique(train_steps_valid, return_inverse=True)
+
+        # Compute weights based on recency of train steps
+        # Higher train_step = more recent = higher weight
+        if len(unique_steps) > 1:
+            if self.recency_strategy == 'windowed_exp':
+                # Windowed exponential decay
+                max_step = unique_steps.max()
+                ages = max_step - unique_steps
+                step_weights = np.where(
+                    ages <= self.recency_window,
+                    1.0,
+                    np.exp(-self.recency_alpha * (ages - self.recency_window))
+                )
+
+            elif self.recency_strategy == 'exp':
+                # Pure exponential decay
+                max_step = unique_steps.max()
+                ages = max_step - unique_steps
+                step_weights = np.exp(-self.recency_alpha * ages)
+
+            elif self.recency_strategy == 'rank':
+                # Rank-based (newest = highest rank)
+                ranks = np.arange(1, len(unique_steps) + 1)
+                step_weights = ranks ** self.recency_alpha
+
+            elif self.recency_strategy == 'power':
+                # Power of normalized step number (original approach, but normalized)
+                min_step = unique_steps.min()
+                normalized_steps = unique_steps - min_step + 1
+                step_weights = normalized_steps ** self.recency_alpha
+
+            else:
+                raise ValueError(f"Unknown recency strategy: {self.recency_strategy}")
+        else:
+            step_weights = np.ones(len(unique_steps))
+
+        # Map step weights back to individual transitions
+        transition_weights = step_weights[inverse_indices]
+        transition_weights = transition_weights / transition_weights.sum()
+
+        # Sample with replacement according to weights
+        sampled_positions = np.random.choice(
+            len(valid_positions),
+            size=num_idxs,
+            replace=True,
+            p=transition_weights
+        )
+        return valid_positions[sampled_positions]
 
     def clear(self):
         """Clear the replay buffer."""
-        self.size = self.pointer = 0
+        self.size = 0
+        if 'valids' in self._dict:
+            self.valid_idxs = np.array([], dtype=np.int64)
+
+    def get_recency_stats(self):
+        """Get statistics about training step recency in the buffer.
+
+        Useful for monitoring/debugging.
+        """
+        if self.size == 0:
+            return {}
+
+        valid_positions = self.valid_idxs if 'valids' in self._dict else np.arange(self.size)
+        train_steps_valid = self.train_steps[valid_positions]
+        unique_steps = np.unique(train_steps_valid)
+
+        return {
+            'num_collection_steps': len(unique_steps),
+            'oldest_train_step': int(unique_steps.min()),
+            'newest_train_step': int(unique_steps.max()),
+            'train_step_range': int(unique_steps.max() - unique_steps.min()),
+        }
+
 
 
 @dataclasses.dataclass
