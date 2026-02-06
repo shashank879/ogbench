@@ -994,6 +994,124 @@ class DHPDataset(HGCDataset):
 
         return batch
 
+
+@dataclasses.dataclass
+class DHPExplDataset(DHPDataset):
+
+    def sample(self, batch_size: int, idxs=None, evaluation=False):
+        """Sample a batch of transitions with goals.
+
+        This method samples a batch of transitions with goals from the dataset. The goals are stored in the keys
+        'value_goals', 'low_actor_goals', 'high_actor_goals', and 'high_actor_targets'. It also computes the 'rewards'
+        and 'masks' based on the indices of the goals.
+
+        Args:
+            batch_size: Batch size.
+            idxs: Indices of the transitions to sample. If None, random indices are sampled.
+            evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
+        """
+        # Check if dataset size changed and refresh if needed
+        self._check_and_refresh()
+
+        if idxs is None:
+            idxs = self.dataset.get_random_idxs(batch_size)
+
+        batch = self.dataset.sample(batch_size, idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(idxs)
+            batch['next_observations'] = self.get_observations(idxs + 1)
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+
+        # Sample linear/sequential value goals.
+        seq_value_goal_idxs = self.sample_low_goals(
+            idxs,
+            self.config['value_p_curgoal'],
+            self.config['value_p_trajgoal'],
+            self.config['value_p_randomgoal'],
+            self.config['value_geom_sample'],
+            self.config.get('value_max_dist', None),
+        )
+        batch['seq_value_goals'] = self.get_observations(seq_value_goal_idxs)
+
+        seq_successes = (idxs == seq_value_goal_idxs).astype(float)
+        batch['seq_masks'] = 1.0 - seq_successes
+        batch['seq_rewards'] = seq_successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        # Sample high value goals.
+        hier_value_goal_idxs, hier_value_subgoal_idxs = self.sample_high_goals(
+            idxs,
+            self.config['hier_value_p_curgoal'],
+            self.config['hier_value_p_trajgoal'],
+            self.config['hier_value_p_randomgoal'],
+            self.config['hier_value_normal_subg_sample'],
+        )
+
+        batch['hier_value_goals'] = self.get_observations(hier_value_goal_idxs)
+        batch['hier_value_subgoals'] = self.get_observations(hier_value_subgoal_idxs)
+
+        step_dist = self.config.get('hier_value_min_dist', self.config['subgoal_steps'])
+        successes_left = (np.abs(idxs - hier_value_subgoal_idxs) <= step_dist).astype(float)
+        successes_right = (np.abs(hier_value_subgoal_idxs - hier_value_goal_idxs) <= step_dist).astype(float)
+        batch['masks_left'] = 1.0 - successes_left
+        batch['masks_right'] = 1.0 - successes_right
+        batch['rewards_left'] = successes_left - (1.0 if self.config['gc_negative'] else 0.0)
+        batch['rewards_right'] = successes_right - (1.0 if self.config['gc_negative'] else 0.0)
+
+        # Set low-level actor goals.
+        low_goal_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
+        batch['low_actor_goals'] = self.get_observations(low_goal_idxs)
+
+        # Sample high-level actor goals and set prediction targets.
+        # High-level future goals.
+        if self.config['actor_geom_sample']:
+            # Geometric sampling.
+            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
+            high_traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+        else:
+            # Uniform sampling.
+            distances = np.random.rand(batch_size)  # in [0, 1)
+            high_traj_goal_idxs = np.round(
+                (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+            ).astype(int)
+        if self.config['hierarchical_planner']:
+            high_traj_target_idxs = np.minimum(
+                (idxs + high_traj_goal_idxs) // 2,
+                high_traj_goal_idxs)
+        else:
+            high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
+
+        # High-level actor random goals.
+        high_random_goal_idxs = self.dataset.get_random_idxs(batch_size)
+        if self.config['hierarchical_planner']:
+            high_random_target_idxs = np.minimum(
+                (idxs + high_traj_goal_idxs) // 2,
+                final_state_idxs)
+        else:
+            high_random_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
+
+        # Pick between high-level future goals and random goals.
+        pick_random = np.random.rand(batch_size) < self.config['actor_p_randomgoal']
+        high_goal_idxs = np.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
+        high_target_idxs = np.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
+
+        batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
+        batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+        batch['start_obs'] = self.get_observations(self.initial_locs[np.searchsorted(self.initial_locs, idxs, side='right') - 1])
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(
+                    batch,
+                    [
+                        'observations',
+                        'next_observations',
+                        'low_value_goals',
+                        'high_value_goals',
+                        'high_value_subgoals',
+                        'low_actor_goals',
+                        'high_actor_goals',
+                        'high_actor_targets',
+                        'start_obs',
                     ],
                 )
 
