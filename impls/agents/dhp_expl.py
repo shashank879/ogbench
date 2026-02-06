@@ -8,8 +8,7 @@ import ml_collections
 import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize, RunningMeanStd
-from utils.state_buffer import GoalBuffer
+from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize
 
 
 class DHPExplAgent(flax.struct.PyTreeNode):
@@ -17,8 +16,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
 
     rng: Any
     network: Any
-    goal_buffer: GoalBuffer = nonpytree_field()
-    low_actor_val_norm: RunningMeanStd
     config: Any = nonpytree_field()
 
     @staticmethod
@@ -44,22 +41,21 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         compute the former and the current value function to compute the latter. This is similar to how double DQN
         mitigates overestimation bias.
         """
-        (next_v1_t, next_v2_t) = self.network.select('target_low_value')(batch['next_observations'], batch['low_value_goals'])
-        next_v_t = jnp.minimum(next_v1_t, next_v2_t)
-        q = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v_t
+        next_v_ts = self.network.select('target_low_value')(batch['next_observations'], batch['low_value_goals'])
+        next_v_t = next_v_ts.min(0)
+        q_mean = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v_t
 
-        (v1_t, v2_t) = self.network.select('target_low_value')(batch['observations'], batch['low_value_goals'])
-        v_t = (v1_t + v2_t) / 2
-        adv = q - v_t
+        v_ts = self.network.select('target_low_value')(batch['observations'], batch['low_value_goals'])
+        v_t = v_ts.mean(0)
+        adv = q_mean - v_t
 
-        q1 = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v1_t
-        q2 = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v2_t
-        (v1, v2) = self.network.select('low_value')(batch['observations'], batch['low_value_goals'], params=grad_params)
-        v = (v1 + v2) / 2
+        qs = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v_ts
+        vs = self.network.select('low_value')(batch['observations'], batch['low_value_goals'], params=grad_params)
+        v = vs.mean(0)
 
-        value_loss1 = self.expectile_loss(adv, q1 - v1, self.config['expectile']).mean()
-        value_loss2 = self.expectile_loss(adv, q2 - v2, self.config['expectile']).mean()
-        value_loss = value_loss1 + value_loss2
+
+        value_losses = self.expectile_loss(adv[None], qs - vs, self.config['expectile']).sum(0)
+        value_loss = value_losses.mean()
 
         return value_loss, {
             'value_loss': value_loss,
@@ -77,30 +73,27 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         compute the former and the current value function to compute the latter. This is similar to how double DQN
         mitigates overestimation bias.
         """
-        (left_next_v1_t, left_next_v2_t) = self.network.select('target_high_value')(batch['observations'], batch['high_value_subgoals'])
-        (right_next_v1_t, right_next_v2_t) = self.network.select('target_high_value')(batch['high_value_subgoals'], batch['high_value_goals'])
-        left_next_v_t = jnp.minimum(left_next_v1_t, left_next_v2_t)
-        right_next_v_t = jnp.minimum(right_next_v1_t, right_next_v2_t)
-        q = self.merge_op(
+        left_next_v_ts = self.network.select('target_high_value')(batch['observations'], batch['high_value_subgoals'])
+        right_next_v_ts = self.network.select('target_high_value')(batch['high_value_subgoals'], batch['high_value_goals'])
+        left_next_v_t = left_next_v_ts.min(0)
+        right_next_v_t = right_next_v_ts.min(0)
+        q_mean = self.merge_op(
             batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v_t,
             batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v_t)
 
-        (v1_t, v2_t) = self.network.select('target_high_value')(batch['observations'], batch['high_value_goals'])
-        v_t = (v1_t + v2_t) / 2
-        adv = q - v_t
+        v_ts = self.network.select('target_high_value')(batch['observations'], batch['high_value_goals'])
+        v_t = v_ts.mean(0)
+        adv = q_mean - v_t
 
-        q1 = self.merge_op(
-            batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v1_t,
-            batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v1_t)
-        q2 = self.merge_op(
-            batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v2_t,
-            batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v2_t)
-        (v1, v2) = self.network.select('high_value')(batch['observations'], batch['high_value_goals'], params=grad_params)
-        v = (v1 + v2) / 2
+        left_qs = batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v_ts
+        right_qs = batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v_ts
+        qs = self.merge_op(left_qs, right_qs)
 
-        value_loss1 = self.expectile_loss(adv, q1 - v1, self.config['expectile']).mean()
-        value_loss2 = self.expectile_loss(adv, q2 - v2, self.config['expectile']).mean()
-        value_loss = value_loss1 + value_loss2
+        vs = self.network.select('high_value')(batch['observations'], batch['high_value_goals'], params=grad_params)
+        v = vs.mean(0)
+
+        value_losses = self.expectile_loss(adv[None], qs - vs, self.config['expectile']).sum(0)
+        value_loss = value_losses.mean()
 
         return value_loss, {
             'value_loss': value_loss,
@@ -111,10 +104,8 @@ class DHPExplAgent(flax.struct.PyTreeNode):
 
     def low_actor_loss(self, batch, grad_params):
         """Compute the low-level actor loss."""
-        v1, v2 = self.network.select('low_value')(batch['observations'], batch['low_actor_goals'])
-        nv1, nv2 = self.network.select('low_value')(batch['next_observations'], batch['low_actor_goals'])
-        v = (v1 + v2) / 2
-        nv = (nv1 + nv2) / 2
+        v = self.network.select('low_value')(batch['observations'], batch['low_actor_goals']).mean(0)
+        nv = self.network.select('low_value')(batch['next_observations'], batch['low_actor_goals']).mean(0)
         adv = nv - v
 
         exp_a = jnp.exp(adv * self.config['low_alpha'])
@@ -132,7 +123,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         log_prob = dist.log_prob(batch['actions'])
 
         actor_loss = -(exp_a * log_prob).mean()
-        norm_v = self.low_actor_val_norm.normalize(v)
 
         actor_info = {
             'actor_loss': actor_loss,
@@ -141,8 +131,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             'v': v.mean(),
             'v_std': v.std(),
             'next_v': nv.mean(),
-            'norm_v_mean': norm_v.mean(),
-            'norm_v_std': norm_v.std(),
         }
         if not self.config['discrete']:
             actor_info.update(
@@ -156,16 +144,17 @@ class DHPExplAgent(flax.struct.PyTreeNode):
 
     def high_actor_loss(self, batch, grad_params):
         """Compute the high-level actor loss."""
-        v1, v2 = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals'])
-        nv1, nv2 = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals'])
-        v = (v1 + v2) / 2
-        nv = (nv1 + nv2) / 2
-        adv = nv - v
+        vs = self.network.select(self.config['high_act_val_fn'])(batch['start_obs'], batch['observations'])
+        nvs = self.network.select(self.config['high_act_val_fn'])(batch['start_obs'], batch['high_actor_targets'])
+        v = vs.mean(0)
+        nv, nv_std = nvs.mean(0), nvs.std(0)
+        # Tries to minimize the gc-value function
+        adv = (v - nv) + (.1 * nv_std)
 
         exp_a = jnp.exp(adv * self.config['high_alpha'])
         exp_a = jnp.minimum(exp_a, 100.0)
 
-        dist = self.network.select('high_actor')(batch['observations'], batch['high_actor_goals'], params=grad_params)
+        dist = self.network.select('high_actor')(batch['observations'], batch['start_obs'], params=grad_params)
         target = self.network.select('goal_rep')(
             jnp.concatenate([batch['observations'], batch['high_actor_targets']], axis=-1)
         )
@@ -174,7 +163,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         actor_loss = -(exp_a * log_prob).mean()
 
         return actor_loss, {
-            'actor_loss': actor_loss,
+            'actor_loss': actor_loss, 
             'adv': adv.mean(),
             'bc_log_prob': log_prob.mean(),
             'mse': jnp.mean((dist.mode() - target) ** 2),
@@ -187,10 +176,12 @@ class DHPExplAgent(flax.struct.PyTreeNode):
     def high_actor_hierplan_loss(self, batch, grad_params):
         """Compute the high-level actor loss."""
         v = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals']).mean(0)
-        left_nv = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_targets']).mean(0)
-        right_nv = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals']).mean(0)
-        nv = self.merge_op(left_nv, right_nv)
-        adv = nv - v
+        left_nv = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_targets'])
+        right_nv = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals'])
+        nvs = self.merge_op(left_nv, right_nv)
+        nv, nv_std = nvs.mean(0), nvs.std(0)
+        # Tries to minimize the gc-value function
+        adv = (v - nv) + (.1 * nv_std)
 
         exp_a = jnp.exp(adv * self.config['high_alpha'])
         exp_a = jnp.minimum(exp_a, 100.0)
@@ -212,62 +203,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             'v': v.mean(),
             'v_std': v.std(),
             'next_v': nv.mean(),
-        }
-
-    def decoder_loss(self, batch, grad_params):
-        """Compute reconstruction loss for goal decoder.
-
-        Decoder learns to invert the goal representation:
-        goal_rep + emb_s -> emb_g
-        """
-        if grad_params:
-            grad_params = {'modules_goal_decoder': grad_params['modules_goal_decoder']}
-        # Get state encoder from value function
-        if self.config['encoder'] is not None:
-            # Extract state embeddings using value function's encoder
-            emb_s = self.network.select('state_encoder')(batch['observations'])
-            emb_g_target = self.network.select('state_encoder')(batch['low_value_goals'])
-        else:
-            # State-based: use observations directly
-            emb_s = batch['observations']
-            emb_g_target = batch['low_value_goals']
-
-        # Compute goal representations
-        goal_reps = self.network.select('goal_rep')(
-            jnp.concatenate([batch['observations'], batch['low_value_goals']], axis=-1)
-        )
-
-        # Decode: [goal_rep; emb_s] -> emb_g
-        decoder_input = jax.lax.stop_gradient(jnp.concatenate([goal_reps, emb_s], axis=-1))
-        emb_g_decoded = self.network.select('goal_decoder')(decoder_input, params=grad_params)
-
-        # Reconstruction loss in embedding space
-        if self.config['decoder_inv_loss']:
-            target_goal_reps = jax.lax.stop_gradient(goal_reps)
-            dec_goal_reps = self.network.select('goal_rep')(
-                jnp.concatenate([batch['observations'], emb_g_decoded], axis=-1)
-            )
-            reconstruction_loss = jnp.mean((target_goal_reps - dec_goal_reps) ** 2)
-            cosine_sim = jnp.sum(dec_goal_reps * target_goal_reps, axis=-1) / (
-                jnp.linalg.norm(dec_goal_reps, axis=-1) * jnp.linalg.norm(target_goal_reps, axis=-1) + 1e-8
-            )
-        else:
-            emb_g_target = jax.lax.stop_gradient(emb_g_target)
-            reconstruction_loss = jnp.mean((emb_g_decoded - emb_g_target) ** 2)
-            cosine_sim = jnp.sum(emb_g_decoded * emb_g_target, axis=-1) / (
-                jnp.linalg.norm(emb_g_decoded, axis=-1) * jnp.linalg.norm(emb_g_target, axis=-1) + 1e-8
-            )
-
-        # Optional: cosine similarity loss for better direction matching
-        cosine_loss = jnp.mean(1 - cosine_sim)
-
-        total_decoder_loss = reconstruction_loss + 0.1 * cosine_loss
-
-        return total_decoder_loss, {
-            'decoder_loss': total_decoder_loss,
-            'recon_mse': reconstruction_loss,
-            'cosine_loss': cosine_loss,
-            'cosine_sim': cosine_sim.mean(),
         }
 
     @jax.jit
@@ -296,14 +231,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
 
         loss = low_value_loss + high_value_loss + low_actor_loss + high_actor_loss
 
-        # # Add decoder loss if enabled
-        # if self.config['use_goal_decoder'] and self.config['decoder_weight']:
-        #     decoder_loss, decoder_info = self.decoder_loss(batch, grad_params)
-        #     for k, v in decoder_info.items():
-        #         info[f'decoder/{k}'] = v
-
-        #     loss = loss + self.config['decoder_weight'] * decoder_loss
-
         return loss, info
 
     def target_update(self, network, module_name):
@@ -314,16 +241,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             self.network.params[f'modules_target_{module_name}'],
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
-
-    def norm_update(self, batch):
-        v = self.network.select('low_value')(batch['observations'], batch['low_actor_goals']).mean(0)
-        new_low_actor_val_norm = self.low_actor_val_norm.update(v)
-        info = {
-            'low_actor/norm_mean': new_low_actor_val_norm.mean,
-            'low_actor/norm_std': jnp.sqrt(new_low_actor_val_norm.var),
-            'low_actor/norm_count': new_low_actor_val_norm.count,
-        }
-        return new_low_actor_val_norm, info
 
     @jax.jit
     def update(self, batch):
@@ -337,46 +254,14 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         self.target_update(new_network, 'low_value')
         self.target_update(new_network, 'high_value')
 
-        new_norm_net, norm_info = self.norm_update(batch)
-        info.update(norm_info)
-
-        return self.replace(network=new_network, low_actor_val_norm=new_norm_net, rng=new_rng), info
-
-    def non_jit_update(self, batch, step):
-        """Non-JIT updates including goal buffer population.
-
-        This should be called after the JIT-compiled update() method.
-
-        Args:
-            batch: Training batch (should be on CPU/numpy for buffer operations)
-
-        Returns:
-            Dictionary with update statistics
-        """
-        info = {}
-
-        update = (not self.goal_buffer.is_full()) or (step % self.config['buffer_update_freq'] == 0)
-
-        # Update goal buffer if enabled
-        if update and (self.goal_buffer is not None and self.config['use_goal_decoder']):
-            # Add to buffer
-            added_count = self.goal_buffer.add_batch(
-                batch['low_value_goals'],
-                # state_encoder=self.network.select('state_encoder'),
-                # goal_rep_fn=lambda x,y: self.network.select('goal_rep')(jnp.concatenate([x, y], -1)),
-                value_fn=lambda x,y: self.network.select('low_value')(x, y).mean(0),
-            )
-            info['buffer/added'] = added_count
-
-            info.update({'buffer/'+k:v for k,v in self.goal_buffer.get_diagnostics().items()})
-
-        return info
+        return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
     def sample_actions(
         self,
         observations,
         goals=None,
+        init_obs=None,
         seed=None,
         temperature=1.0,
     ):
@@ -385,11 +270,9 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         It first queries the high-level actor to obtain subgoal representations, and then queries the low-level actor
         to obtain raw actions.
         """
-        if self.config['hierarchical_planner']:
-            return self.sample_hierarchical_actions(observations, goals, seed, temperature)
         high_seed, low_seed = jax.random.split(seed)
 
-        high_dist = self.network.select('high_actor')(observations, goals, temperature=temperature)
+        high_dist = self.network.select('high_actor')(observations, init_obs, temperature=temperature)
         goal_reps = high_dist.sample(seed=high_seed)
         goal_reps = goal_reps / jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) * jnp.sqrt(goal_reps.shape[-1])
 
@@ -527,26 +410,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         goal_rep_seq.append(LengthNormalize())
         goal_rep_def = nn.Sequential(goal_rep_seq)
 
-        # Define goal decoder: [goal_rep; emb_s] -> emb_g
-        if config.get('use_goal_decoder', False):
-            if config['encoder'] is not None:
-                # For pixel-based: need to determine encoder output dimension
-                encoder_output_dim = goal_rep_seq[0].mlp_hidden_dims[-1]
-            else:
-                # For state-based: embedding dimension = observation dimension
-                # encoder_output_dim = ex_observations.shape[-1]
-                encoder_output_dim = ex_observations.shape[-1]
-
-            decoder_input_dim = config['rep_dim'] + encoder_output_dim
-            goal_decoder_def = MLP(
-                hidden_dims=(*config['value_hidden_dims'], encoder_output_dim),
-                activate_final=False,
-                layer_norm=config['layer_norm'],
-            )
-        else:
-            goal_decoder_def = None
-            decoder_input_dim = None
-
         # Define the encoders that handle the inputs to the value and actor networks.
         # The subgoal representation phi([s; g]) is trained by the parameterized value function V(s, phi([s; g])).
         # The high-level actor predicts the subgoal representation phi([s; w]) for subgoal w given s and g.
@@ -585,12 +448,14 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             ensemble=True,
             gc_encoder=low_value_encoder_def,
+            num_ensembles=config['value_num_ensembles'],
         )
         target_low_value_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             ensemble=True,
             gc_encoder=target_low_value_encoder_def,
+            num_ensembles=config['value_num_ensembles'],
         )
 
         high_value_def = GCValue(
@@ -598,12 +463,14 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             ensemble=True,
             gc_encoder=high_value_encoder_def,
+            num_ensembles=config['value_num_ensembles'],
         )
         target_high_value_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             ensemble=True,
             gc_encoder=target_high_value_encoder_def,
+            num_ensembles=config['value_num_ensembles'],
         )
 
         if config['discrete']:
@@ -639,12 +506,6 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             high_actor=(high_actor_def, (ex_observations, ex_goals)),
         )
 
-        # # Add decoder if enabled
-        # if config.get('use_goal_decoder', False):
-        #     ex_dec_input = jnp.zeros((1, decoder_input_dim))
-        #     network_info['goal_decoder'] = (goal_decoder_def, (ex_dec_input,))
-        #     network_info['state_encoder'] = (low_value_encoder_def.state_encoder, (ex_observations,))
-
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -672,11 +533,12 @@ def get_config():
     config = ml_collections.ConfigDict(
         dict(
             # Agent hyperparameters.
-            agent_name='dhpbuff',  # Agent name.
+            agent_name='dhpexpl',  # Agent name.
             lr=3e-4,  # Learning rate.
             batch_size=1024,  # Batch size.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
+            value_num_ensembles=6,
             layer_norm=True,  # Whether to use layer normalization.
             high_discount=0.9,  # High Discount factor.
             discount=0.99,  # Low Discount factor.
@@ -690,7 +552,7 @@ def get_config():
             const_std=True,  # Whether to use constant standard deviation for the actors.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
-            hierarchical_planner=True,
+            hierarchical_planner=False,
             reachable_thresh_val=-1.5,
             hierplan_depth=8,
             high_act_val_fn='high_value',  # [high_value, low_value]

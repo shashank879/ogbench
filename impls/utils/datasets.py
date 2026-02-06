@@ -551,6 +551,7 @@ class DHPDataset(HGCDataset):
 
         batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
         batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+        batch['start_obs'] = self.get_observations(self.initial_locs[np.searchsorted(self.initial_locs, idxs, side='right') - 1])
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
@@ -565,6 +566,12 @@ class DHPDataset(HGCDataset):
                         'low_actor_goals',
                         'high_actor_goals',
                         'high_actor_targets',
+                        'start_obs',
+                    ],
+                )
+
+        return batch
+
                     ],
                 )
 
