@@ -143,17 +143,14 @@ class DHPExplAgent(flax.struct.PyTreeNode):
 
     def high_actor_loss(self, batch, grad_params):
         """Compute the high-level actor loss."""
-        vs = self.network.select(self.config['high_act_val_fn'])(batch['start_obs'], batch['observations'])
-        nvs = self.network.select(self.config['high_act_val_fn'])(batch['start_obs'], batch['high_actor_targets'])
-        v = vs.mean(0)
-        nv, nv_std = nvs.mean(0), nvs.std(0)
-        # Tries to minimize the gc-value function
-        adv = (v - nv) + (.1 * nv_std)
+        v = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals']).mean(0)
+        nv = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals']).mean(0)
+        adv = nv - v
 
         exp_a = jnp.exp(adv * self.config['high_alpha'])
         exp_a = jnp.minimum(exp_a, 100.0)
 
-        dist = self.network.select('high_actor')(batch['observations'], batch['start_obs'], params=grad_params)
+        dist = self.network.select('high_actor')(batch['observations'], batch['high_actor_goals'], params=grad_params)
         target = self.network.select('goal_rep')(
             jnp.concatenate([batch['observations'], batch['high_actor_targets']], axis=-1)
         )
@@ -162,7 +159,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         actor_loss = -(exp_a * log_prob).mean()
 
         return actor_loss, {
-            'actor_loss': actor_loss, 
+            'actor_loss': actor_loss,
             'adv': adv.mean(),
             'bc_log_prob': log_prob.mean(),
             'mse': jnp.mean((dist.mode() - target) ** 2),
@@ -204,6 +201,38 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             'next_v': nv.mean(),
         }
 
+    def expl_actor_loss(self, batch, grad_params):
+        """Compute the high-level actor loss."""
+        vs = self.network.select(self.config['high_act_val_fn'])(batch['start_obs'], batch['observations'])
+        nvs = self.network.select(self.config['high_act_val_fn'])(batch['start_obs'], batch['high_actor_targets'])
+        v = vs.mean(0)
+        nv, nv_std = nvs.mean(0), nvs.std(0)
+        # Tries to minimize the gc-value function
+        adv = (v - nv) + (1. * nv_std)
+
+        exp_a = jnp.exp(adv * self.config['high_alpha'])
+        exp_a = jnp.minimum(exp_a, 100.0)
+
+        dist = self.network.select('expl_actor')(batch['observations'], batch['start_obs'], params=grad_params)
+        target = self.network.select('goal_rep')(
+            jnp.concatenate([batch['observations'], batch['high_actor_targets']], axis=-1)
+        )
+        log_prob = dist.log_prob(target)
+
+        actor_loss = -(exp_a * log_prob).mean()
+
+        return actor_loss, {
+            'actor_loss': actor_loss,
+            'adv': adv.mean(),
+            'bc_log_prob': log_prob.mean(),
+            'mse': jnp.mean((dist.mode() - target) ** 2),
+            'std': jnp.mean(dist.scale_diag),
+            'v': v.mean(),
+            'v_std': v.std(),
+            'next_v': nv.mean(),
+            'next_v_std': nv_std.mean(),
+        }
+
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         """Compute the total loss."""
@@ -228,7 +257,11 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         for k, v in high_actor_info.items():
             info[f'high_actor/{k}'] = v
 
-        loss = seq_value_loss + hier_value_loss + low_actor_loss + high_actor_loss
+        expl_actor_loss, expl_actor_info = self.expl_actor_loss(batch, grad_params)
+        for k, v in expl_actor_info.items():
+            info[f'expl_actor/{k}'] = v
+
+        loss = seq_value_loss + hier_value_loss + low_actor_loss + high_actor_loss + expl_actor_loss
 
         return loss, info
 
@@ -260,6 +293,32 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         self,
         observations,
         goals=None,
+        seed=None,
+        temperature=1.0,
+    ):
+        """Sample actions from the actor.
+
+        It first queries the high-level actor to obtain subgoal representations, and then queries the low-level actor
+        to obtain raw actions.
+        """
+        high_seed, low_seed = jax.random.split(seed)
+
+        high_dist = self.network.select('high_actor')(observations, goals, temperature=temperature)
+        goal_reps = high_dist.sample(seed=high_seed)
+        goal_reps = goal_reps / jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) * jnp.sqrt(goal_reps.shape[-1])
+
+        low_dist = self.network.select('low_actor')(observations, goal_reps, goal_encoded=True, temperature=temperature)
+        actions = low_dist.sample(seed=low_seed)
+
+        if not self.config['discrete']:
+            actions = jnp.clip(actions, -1, 1)
+        return actions
+
+    @jax.jit
+    def explore(
+        self,
+        observations,
+        goals=None,
         init_obs=None,
         seed=None,
         temperature=1.0,
@@ -271,7 +330,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
         """
         high_seed, low_seed = jax.random.split(seed)
 
-        high_dist = self.network.select('high_actor')(observations, init_obs, temperature=temperature)
+        high_dist = self.network.select('expl_actor')(observations, init_obs, temperature=temperature)
         goal_reps = high_dist.sample(seed=high_seed)
         goal_reps = goal_reps / jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) * jnp.sqrt(goal_reps.shape[-1])
 
@@ -341,6 +400,8 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             low_actor_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
             # High-level actor: pi^h(. | encoder^h([s; g]))
             high_actor_encoder_def = GCEncoder(concat_encoder=encoder_module())
+            # Exploring High-level actor: pi^e(. | encoder^e([s; g]))
+            expl_actor_encoder_def = GCEncoder(concat_encoder=encoder_module())
         else:
             # State-based environments only use the pre-defined shared encoder for subgoal representations.
 
@@ -354,6 +415,8 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             low_actor_encoder_def = GCEncoder(state_encoder=Identity(), concat_encoder=goal_rep_def)
             # High-level actor: pi^h(. | s, g) (i.e., no encoder)
             high_actor_encoder_def = None
+            # Exploring High-level actor: pi^e(. | s, g) (i.e., no encoder)
+            expl_actor_encoder_def = None
 
         # Define value and actor networks.
         seq_value_def = GCValue(
@@ -409,6 +472,14 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             gc_encoder=high_actor_encoder_def,
         )
 
+        expl_actor_def = GCActor(
+            hidden_dims=config['actor_hidden_dims'],
+            action_dim=config['rep_dim'],
+            state_dependent_std=False,
+            const_std=config['const_std'],
+            gc_encoder=expl_actor_encoder_def,
+        )
+
         network_info = dict(
             goal_rep=(goal_rep_def, (jnp.concatenate([ex_observations, ex_goals], axis=-1))),
             seq_value=(seq_value_def, (ex_observations, ex_goals)),
@@ -417,6 +488,7 @@ class DHPExplAgent(flax.struct.PyTreeNode):
             target_hier_value=(target_hier_value_def, (ex_observations, ex_goals)),
             low_actor=(low_actor_def, (ex_observations, ex_goals)),
             high_actor=(high_actor_def, (ex_observations, ex_goals)),
+            expl_actor=(expl_actor_def, (ex_observations, ex_goals)),
         )
 
         networks = {k: v[0] for k, v in network_info.items()}
