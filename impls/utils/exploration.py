@@ -8,7 +8,7 @@ import numpy as np
 from .evaluation import supply_rng
 
 
-def collect_exploration_episodes(agent, env, num_episodes, config, temperature=1.0, gaussian_noise=None, max_steps=1000):
+def collect_exploration_episodes(policy, env, num_episodes, config, temperature=1.0, gaussian_noise=None, max_steps=1000):
     """
     Collect exploration episodes using the current agent policy.
 
@@ -26,12 +26,12 @@ def collect_exploration_episodes(agent, env, num_episodes, config, temperature=1
         episode_returns: List of episode returns
         episode_lengths: List of episode lengths
     """
-    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    actor_fn = supply_rng(policy, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     episodes = []
     episode_returns = []
     episode_lengths = []
 
-    for ep in tqdm.tqdm(range(num_episodes)):
+    for ep in tqdm.tqdm(range(num_episodes), 'Exploring'):
         obs, info = env.reset()  # Get info too
         goal = info.get('goal')  # Get goal from info like in evaluation
         # first_obs = obs
@@ -46,7 +46,7 @@ def collect_exploration_episodes(agent, env, num_episodes, config, temperature=1
                 first_obs = obs
             # Match evaluation code - no [None] indexing
             inputs = dict(observations=obs, goals=goal, temperature=temperature)
-            if 'init_obs' in inspect.signature(agent.sample_actions).parameters:
+            if 'init_obs' in inspect.signature(policy).parameters:
                 inputs['init_obs'] = first_obs
             action = actor_fn(**inputs)
 

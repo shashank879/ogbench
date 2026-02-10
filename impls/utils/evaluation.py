@@ -36,7 +36,7 @@ def add_to(dict_of_lists, single_dict):
 
 
 def evaluate(
-    agent,
+    policy,
     env,
     task_id=None,
     config=None,
@@ -62,7 +62,7 @@ def evaluate(
     Returns:
         A tuple containing the statistics, trajectories, and rendered videos.
     """
-    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    actor_fn = supply_rng(policy, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
 
@@ -81,7 +81,7 @@ def evaluate(
         render = []
         while not done:
             inputs = dict(observations=observation, goals=goal, temperature=eval_temperature)
-            if 'init_obs' in inspect.signature(agent.sample_actions).parameters:
+            if 'init_obs' in inspect.signature(policy).parameters:
                 inputs['init_obs'] = first_obs
             action = actor_fn(**inputs)
             action_info = None
@@ -114,7 +114,7 @@ def evaluate(
                 goal=goal,
                 goal_frame=goal_frame,
             )
-            if 'init_obs' in inspect.signature(agent.sample_actions).parameters:
+            if 'init_obs' in inspect.signature(policy).parameters:
                 transition['init_obs'] = first_obs
             if action_info:
                 transition.update(action_info)

@@ -152,7 +152,7 @@ def main(_):
         if FLAGS.exploration_mode != 'none' and (i==1 or i % FLAGS.exploration_interval == 0):
             print(f'\n[EXPLORATION] Collecting {FLAGS.exploration_episodes} episodes at step {i}...')
             episodes, returns, lengths = collect_exploration_episodes(
-                agent=agent,
+                policy=agent.explore,
                 env=env,
                 num_episodes=FLAGS.exploration_episodes,
                 config=config,
@@ -243,6 +243,9 @@ def main(_):
                 eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
             else:
                 eval_agent = agent
+
+            # Plan evaluation
+            print('Evaluating Planner...')
             renders = []
             eval_metrics = {}
             overall_metrics = defaultdict(list)
@@ -251,7 +254,7 @@ def main(_):
             for task_id in tqdm.trange(1, num_tasks + 1):
                 task_name = task_infos[task_id - 1]['task_name']
                 eval_info, trajs, cur_renders, cur_render_trajs = evaluate(
-                    agent=eval_agent,
+                    policy=eval_agent.sample_actions,
                     env=env,
                     task_id=task_id,
                     config=config,
