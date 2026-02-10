@@ -47,15 +47,16 @@ flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 flags.DEFINE_boolean('debug', False, 'Run in debug mode.')
 
 # Exploration flags
-flags.DEFINE_enum('exploration_mode', 'none', ['none', 'pretrain', 'interleaved'], 'Exploration mode: none (offline only), pretrain (explore then train), interleaved (explore during training)')
-flags.DEFINE_integer('exploration_episodes', 10, 'Number of exploration episodes (for pretrain mode)')
-flags.DEFINE_integer('exploration_interval', 5000, 'Exploration interval in training steps (for interleaved mode)')
+flags.DEFINE_enum('expl_mode', 'none', ['none', 'pretrain', 'interleaved'], 'Exploration mode: none (offline only), pretrain (explore then train), interleaved (explore during training)')
+flags.DEFINE_integer('expl_episodes', 10, 'Number of exploration episodes (for pretrain mode)')
+flags.DEFINE_integer('expl_interval', 5000, 'Exploration interval in training steps (for interleaved mode)')
 flags.DEFINE_integer('replay_buffer_size', 1000000, 'Size of online replay buffer')
 flags.DEFINE_float('offline_online_ratio', 0.5, 'Ratio of offline to online data (0.5 = 50% offline, 50% online). 1.0 = only offline, 0.0 = only online')
-flags.DEFINE_float('exploration_temperature', 1.0, 'Temperature for exploration policy')
-flags.DEFINE_float('exploration_gaussian', None, 'Gaussian noise std for exploration')
-# flags.DEFINE_boolean('init_buffer_with_offline', False, 'Initialize replay buffer with offline dataset')
-flags.DEFINE_integer('exploration_max_steps', 1000, 'Max steps per exploration episode')
+flags.DEFINE_float('expl_temperature', 1.0, 'Temperature for exploration policy')
+flags.DEFINE_float('expl_gaussian', None, 'Gaussian noise std for exploration')
+flags.DEFINE_integer('expl_max_steps', 1000, 'Max steps per exploration episode')
+flags.DEFINE_boolean('recency_sampling', True, 'Use recency sampling for the replay buffer')
+flags.DEFINE_string('recency_strategy', 'windowed_exp', 'Recency sampling strategy: [windowed_exp, exp, rank, power]')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
@@ -92,7 +93,7 @@ def main(_):
     if val_dataset is not None:
         val_dataset = dataset_class(Dataset.create(**val_dataset), config)
 
-    if FLAGS.exploration_mode != 'none' and FLAGS.offline_online_ratio < 1.:
+    if FLAGS.expl_mode != 'none' and FLAGS.offline_online_ratio < 1.:
         example_transition = {k: v[0] for k,v in offline_dataset.sample(1).items()}
         replay_buffer = ReplayBuffer.create(example_transition, FLAGS.replay_buffer_size, use_recency=FLAGS.recency_sampling, recency_strat=FLAGS.recency_strategy)
         print(f'[REPLAY BUFFER] Created empty buffer of capacity {FLAGS.replay_buffer_size}, and current size {replay_buffer.size}')
@@ -143,22 +144,21 @@ def main(_):
     first_time = time.time()
     last_time = time.time()
     best_metric = None
-    total_exploration_episodes = 0
+    total_expl_episodes = 0
     task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
     num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
 
-    for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
+    for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True, desc='Training'):
         # INTERLEAVED EXPLORATION: Collect data during training
-        if FLAGS.exploration_mode != 'none' and (i==1 or i % FLAGS.exploration_interval == 0):
-            print(f'\n[EXPLORATION] Collecting {FLAGS.exploration_episodes} episodes at step {i}...')
+        if FLAGS.expl_mode != 'none' and (i==1 or i % FLAGS.expl_interval == 0):
             episodes, returns, lengths = collect_exploration_episodes(
                 policy=agent.explore,
                 env=env,
-                num_episodes=FLAGS.exploration_episodes,
+                num_episodes=FLAGS.expl_episodes,
                 config=config,
-                temperature=FLAGS.exploration_temperature,
-                gaussian_noise=FLAGS.exploration_gaussian,
-                max_steps=FLAGS.exploration_max_steps
+                temperature=FLAGS.expl_temperature,
+                gaussian_noise=FLAGS.expl_gaussian,
+                max_steps=FLAGS.expl_max_steps
             )
             exploration_metrics = {
                     'exploration/mean_return': np.mean(returns),
@@ -171,7 +171,7 @@ def main(_):
                 for episode in episodes:
                     replay_buffer.add_episode(episode, i)
 
-                total_exploration_episodes += FLAGS.exploration_episodes
+                total_expl_episodes += FLAGS.expl_episodes
 
                 recency_stats = replay_buffer.get_recency_stats()
                 exploration_metrics.update({
