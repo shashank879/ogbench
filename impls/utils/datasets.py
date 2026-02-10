@@ -90,7 +90,7 @@ class ReplayBuffer(Dataset):
     """
 
     @classmethod
-    def create(cls, transition, size):
+    def create(cls, transition, size, use_recency=True, recency_strat='exp'):
         """Create a replay buffer from an example transition.
 
         Args:
@@ -110,10 +110,14 @@ class ReplayBuffer(Dataset):
         instance.max_size = size
         instance.size = 0
         instance.train_steps = np.zeros(size, dtype=np.int64)
-        instance.use_recency = True
-        instance.recency_strategy = 'windowed_exp'
+        instance.use_recency = use_recency
+        instance.recency_strategy = recency_strat
         instance.recency_alpha = 1e-5
         instance.recency_window = 50000
+        instance.recency_weights = None
+        instance._cached_max_step = 0
+        instance.train_max_step = 0
+        instance.csum_weights = None
 
         # Set valid_idxs if valids key exists
         if 'valids' in buffer_dict:
@@ -129,6 +133,10 @@ class ReplayBuffer(Dataset):
         self.recency_strategy = 'windowed_exp'
         self.recency_alpha = 1e-5
         self.recency_window = 50000
+        self.recency_weights = None
+        self._cached_max_step = 0
+        self.train_max_step = 0
+        self.csum_weights = None
 
     @classmethod
     def create_from_initial_dataset(cls, init_dataset, size):
@@ -152,10 +160,14 @@ class ReplayBuffer(Dataset):
         instance.max_size = size
         instance.size = min(get_size(init_dataset), size)
         instance.train_steps = np.zeros(size, dtype=np.int64)
-        instance.use_recency = True
+        instance.use_recency = False
         instance.recency_strategy = 'windowed_exp'
         instance.recency_alpha = 1e-5
         instance.recency_window = 50000
+        instance.recency_weights = None
+        instance._cached_max_step = 0
+        instance.train_max_step = 0
+        instance.csum_weights = None
 
         # Set valid_idxs if valids exist
         if 'valids' in buffer_dict:
@@ -176,6 +188,7 @@ class ReplayBuffer(Dataset):
                 self._dict[key][:-1] = self._dict[key][1:]
             self.train_steps[:-1] = self.train_steps[1:]
             idx = self.size - 1
+        self.train_max_step = max(train_step, self.train_max_step)
 
         # Write new transition at idx
         for key, value in transition.items():
@@ -230,6 +243,7 @@ class ReplayBuffer(Dataset):
         if 'valids' in self._dict:
             valids = self._dict['valids'][:self.size]
             (self.valid_idxs,) = np.nonzero(valids > 0)
+        self.train_max_step = max(train_step, self.train_max_step)
 
     def add_episode(self, episode_dict, train_step=0):
         """Add a complete episode to the buffer."""
@@ -240,28 +254,14 @@ class ReplayBuffer(Dataset):
             transitions.append(transition)
         self.add_transitions(transitions, train_step=train_step)
 
-    def get_random_idxs(self, num_idxs):
-        """Return `num_idxs` random indices.
+    def get_recency_weights(self, valid_positions):
+        # train_steps_valid = self.train_steps[valid_positions]
+        # current_max_step = self.train_steps.max()
+        if (self._cached_max_step == self.train_max_step and 
+            self.recency_weights is not None and
+            len(self.recency_weights) == len(valid_positions)):
+            return self.recency_weights
 
-        If use_recency is True, samples with bias toward recent training steps.
-        Otherwise, samples uniformly.
-
-        Args:
-            num_idxs: Number of indices to sample
-
-        Returns:
-            Array of sampled indices
-        """
-        if 'valids' in self._dict:
-            valid_positions = self.valid_idxs
-        else:
-            valid_positions = np.arange(self.size)
-
-        if not self.use_recency or self.size == 0:
-            # Uniform sampling (original behavior)
-            return valid_positions[np.random.randint(len(valid_positions), size=num_idxs)]
-
-        # Recency-weighted sampling
         # Get train steps for valid positions
         train_steps_valid = self.train_steps[valid_positions]
 
@@ -304,17 +304,40 @@ class ReplayBuffer(Dataset):
             step_weights = np.ones(len(unique_steps))
 
         # Map step weights back to individual transitions
-        transition_weights = step_weights[inverse_indices]
-        transition_weights = transition_weights / transition_weights.sum()
+        weights = step_weights[inverse_indices]
+        self.recency_weights = weights / weights.sum()
+        self._cached_max_step = self.train_max_step
+        self.csum_weights = np.cumsum(weights)
+        return self.recency_weights
+
+    def get_random_idxs(self, num_idxs):
+        """Return `num_idxs` random indices.
+
+        If use_recency is True, samples with bias toward recent training steps.
+        Otherwise, samples uniformly.
+
+        Args:
+            num_idxs: Number of indices to sample
+
+        Returns:
+            Array of sampled indices
+        """
+        if 'valids' in self._dict:
+            valid_positions = self.valid_idxs
+        else:
+            valid_positions = np.arange(self.size)
+
+        if not self.use_recency or self.size == 0:
+            return valid_positions[np.random.randint(len(valid_positions), size=num_idxs)]
 
         # Sample with replacement according to weights
-        sampled_positions = np.random.choice(
-            len(valid_positions),
-            size=num_idxs,
-            replace=True,
-            p=transition_weights
-        )
-        return valid_positions[sampled_positions]
+        weights = self.get_recency_weights(valid_positions)
+        cumsum = self.csum_weights
+        total = cumsum[-1]
+        random_vals = np.random.uniform(0, total, size=num_idxs)
+        sampled_indices = np.searchsorted(cumsum, random_vals)
+
+        return valid_positions[sampled_indices]
 
     def clear(self):
         """Clear the replay buffer."""

@@ -94,7 +94,7 @@ def main(_):
 
     if FLAGS.exploration_mode != 'none' and FLAGS.offline_online_ratio < 1.:
         example_transition = {k: v[0] for k,v in offline_dataset.sample(1).items()}
-        replay_buffer = ReplayBuffer.create(example_transition, FLAGS.replay_buffer_size)
+        replay_buffer = ReplayBuffer.create(example_transition, FLAGS.replay_buffer_size, use_recency=FLAGS.recency_sampling, recency_strat=FLAGS.recency_strategy)
         print(f'[REPLAY BUFFER] Created empty buffer of capacity {FLAGS.replay_buffer_size}, and current size {replay_buffer.size}')
 
         if FLAGS.offline_online_ratio == .0:
