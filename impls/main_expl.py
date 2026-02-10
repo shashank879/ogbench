@@ -14,7 +14,7 @@ from agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset, DHPDataset, DHPExplDataset, ReplayBuffer, MixedDataset
 from utils.env_utils import make_env_and_datasets
-from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video, plot_value_function_grid
+from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video, plot_value_function_grid, compute_maze_coverage
 from utils.evaluation import evaluate
 from utils.exploration import collect_exploration_episodes
 from utils.flax_utils import restore_agent, save_agent
@@ -39,6 +39,7 @@ flags.DEFINE_string('best_metric_key', 'evaluation/overall_success', 'Saving int
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
+flags.DEFINE_integer('expl_eval_episodes', 10, 'Number of episodes for each task.')
 flags.DEFINE_float('eval_temperature', 0, 'Actor temperature for evaluation.')
 flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.')
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
@@ -139,7 +140,6 @@ def main(_):
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
-    exploration_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'exploration.csv'))
 
     first_time = time.time()
     last_time = time.time()
@@ -151,7 +151,7 @@ def main(_):
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True, desc='Training'):
         # INTERLEAVED EXPLORATION: Collect data during training
         if FLAGS.expl_mode != 'none' and (i==1 or i % FLAGS.expl_interval == 0):
-            episodes, returns, lengths = collect_exploration_episodes(
+            episodes, _, _ = collect_exploration_episodes(
                 policy=agent.explore,
                 env=env,
                 num_episodes=FLAGS.expl_episodes,
@@ -160,11 +160,6 @@ def main(_):
                 gaussian_noise=FLAGS.expl_gaussian,
                 max_steps=FLAGS.expl_max_steps
             )
-            exploration_metrics = {
-                    'exploration/mean_return': np.mean(returns),
-                    'exploration/mean_length': np.mean(lengths),
-                    'exploration/total_episodes': total_exploration_episodes,
-            }
 
             if replay_buffer:
                 # Add episodes to buffer
@@ -174,18 +169,17 @@ def main(_):
                 total_expl_episodes += FLAGS.expl_episodes
 
                 recency_stats = replay_buffer.get_recency_stats()
-                exploration_metrics.update({
+                buffer_metrics = {
                     'buffer/train_dataset_size': train_dataset.size,  # This will show the updated size,
                     'buffer/offline_size': offline_dataset.size,
                     'buffer/online_size': replay_buffer.size,
                     'buffer/num_collection_steps': recency_stats['num_collection_steps'],
                     'buffer/train_step_range': recency_stats['train_step_range'],
                     'buffer/oldest_train_step': recency_stats['oldest_train_step'],
-                })
-
-            if not FLAGS.debug:
-                wandb.log(exploration_metrics, step=i)
-            exploration_logger.log(exploration_metrics, step=i)
+                }
+                if not FLAGS.debug:
+                    wandb.log(buffer_metrics, step=i)
+                train_logger.log(buffer_metrics, step=i)
 
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
@@ -283,10 +277,10 @@ def main(_):
                 n_tasks=num_tasks,
                 env=env,
                 grid_size=100,
-                output_path=os.path.join(FLAGS.save_dir, 'eval_value_func_image', f'step_{i}.png'),
+                output_path=os.path.join(FLAGS.save_dir, 'plan_trajs', f'step_{i}.png'),
                 all_trajs=all_trajs,
             )
-            eval_metrics['inf_value_image'] = wandb.Image(val_image)
+            eval_metrics['plan_trajs'] = wandb.Image(val_image)
 
             if FLAGS.video_episodes > 0:
                 if not FLAGS.debug:
@@ -308,6 +302,47 @@ def main(_):
                     if goal_video is not None:
                         eval_metrics['subgoals_video'] = goal_video
 
+            # Explorer evaluation
+            print('Evaluating Explorer...')
+            renders = []
+            # expl_metrics = {}
+            overall_metrics = defaultdict(list)
+            all_trajs = []
+            for task_id in tqdm.trange(1, num_tasks + 1):
+                task_name = task_infos[task_id - 1]['task_name']
+                _, trajs, cur_renders, cur_render_trajs = evaluate(
+                    policy=eval_agent.explore,
+                    env=env,
+                    task_id=task_id,
+                    config=config,
+                    num_eval_episodes=FLAGS.expl_eval_episodes,
+                    num_video_episodes=FLAGS.video_episodes,
+                    video_frame_skip=FLAGS.video_frame_skip,
+                    eval_temperature=FLAGS.expl_temperature,
+                    eval_gaussian=FLAGS.expl_gaussian,
+                )
+                all_trajs.append(trajs)
+                renders.extend(cur_renders)
+
+            coverage_metrics = compute_maze_coverage(env, all_trajs)
+            eval_metrics.update({'expl_evaluation/' + k:v for k,v in coverage_metrics.items()})
+
+            val_image = plot_value_function_grid(
+                agent=agent,
+                agent_name = config['agent_name'],
+                n_tasks=num_tasks,
+                env=env,
+                grid_size=100,
+                output_path=os.path.join(FLAGS.save_dir, 'expl_trajs', f'step_{i}.png'),
+                all_trajs=all_trajs,
+            )
+            eval_metrics['expl_trajs'] = wandb.Image(val_image)
+
+            if FLAGS.video_episodes > 0:
+                if not FLAGS.debug:
+                    video = get_wandb_video(renders=renders.copy(), n_cols=num_tasks)
+                    eval_metrics['expl_video'] = video
+
             if not FLAGS.debug:
                 wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)
@@ -322,7 +357,6 @@ def main(_):
 
     train_logger.close()
     eval_logger.close()
-    exploration_logger.close()
 
 
 if __name__ == '__main__':

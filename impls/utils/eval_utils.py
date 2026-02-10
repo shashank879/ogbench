@@ -884,3 +884,72 @@ def plot_value_function_grid(agent, agent_name, n_tasks, env, grid_size=100, out
     plt.close()
 
     return img_array
+
+
+def compute_maze_coverage(env, trajs_per_task):
+    """
+    Compute coverage statistics for exploration trajectories.
+    
+    Args:
+        env: The maze environment
+        trajs_per_task: List of lists - trajs_per_task[task_idx] = [episode1, episode2, ...]
+                        where each episode is a dict with 'observation' key
+    
+    Returns:
+        dict with coverage metrics
+    """
+    env_u = env.unwrapped
+    S = env_u._maze_unit
+    maze_map = env_u.maze_map
+
+    # Find all visitable cells (non-wall cells)
+    visitable_cells = set()
+    for i in range(len(maze_map)):
+        for j in range(len(maze_map[0])):
+            if maze_map[i][j] == 0:  # 0 = empty space, 1 = wall
+                visitable_cells.add((i, j))
+
+    total_visitable = len(visitable_cells)
+
+    # Track coverage per task
+    per_task_coverage = []
+    per_task_visited_cells = []
+
+    for task_idx, task_trajs in enumerate(trajs_per_task):
+        # Collect all visited cells for this task across all episodes
+        visited_cells = set()
+
+        for episode in task_trajs:
+            observations = np.array(episode['observation'])
+            # Extract x, y positions
+            x_positions = observations[:, 0]
+            y_positions = observations[:, 1]
+
+            # Convert continuous positions to discrete cell indices
+            for x, y in zip(x_positions, y_positions):
+                # Convert to cell coordinates
+                cell_j = int((x + env_u._offset_x + S/2) / S)
+                cell_i = int((y + env_u._offset_y + S/2) / S)
+
+                # Clamp to valid range
+                cell_i = max(0, min(cell_i, len(maze_map) - 1))
+                cell_j = max(0, min(cell_j, len(maze_map[0]) - 1))
+
+                # Only count if it's a visitable cell
+                if (cell_i, cell_j) in visitable_cells:
+                    visited_cells.add((cell_i, cell_j))
+
+        # Compute coverage for this task
+        task_coverage = len(visited_cells) / total_visitable if total_visitable > 0 else 0.0
+        per_task_coverage.append(task_coverage)
+        per_task_visited_cells.append(len(visited_cells))
+
+    # Compute overall statistics
+    return {
+        'coverage/mean': np.mean(per_task_coverage),
+        'coverage/std': np.std(per_task_coverage),
+        'coverage/min': np.min(per_task_coverage),
+        'coverage/max': np.max(per_task_coverage),
+        'coverage/mean_cells_visited': np.mean(per_task_visited_cells),
+        **{f'coverage/task_{i+1}': cov for i, cov in enumerate(per_task_coverage)}
+    }
