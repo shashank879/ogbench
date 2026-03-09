@@ -725,7 +725,7 @@ def create_goal_trajectory_video(
     return wandb.Video(video_array, fps=20, format="mp4")
 
 
-def draw(env, ax=None):
+def draw(env, ax=None, maze_wall_style='fill'):
     if not ax:
         ax = plt.gca()
     env_u = env.unwrapped
@@ -734,13 +734,17 @@ def draw(env, ax=None):
         for j in range(len(env_u.maze_map[0])):
             struct = env_u.maze_map[i][j]
             if struct == 1:
+                kw = dict(linewidth=1, edgecolor='none', facecolor='grey', alpha=1.0)
+                if maze_wall_style == 'hatch':
+                    kw['hatch'] = '/'
+                    kw['fill'] = False
                 rect = patches.Rectangle(
                     (j * S - (env_u._offset_x) - S / 2, i * S - (env_u._offset_y) - S / 2),
-                    S, S, linewidth=1, edgecolor='none', facecolor='grey', alpha=1.0)
+                    S, S, )
                 ax.add_patch(rect)
 
 
-def plot_value_function_grid(agent, agent_name, n_tasks, env, grid_size=100, output_path="value_function.png", draw_maze=True, all_trajs=None):
+def plot_value_function_grid(agent, agent_name, n_tasks, env, grid_size=100, output_path=None, draw_maze=True, maze_wall_style='fill', all_trajs=None):
     """
     Plot value function for multiple tasks in a grid of subplots.
 
@@ -830,7 +834,7 @@ def plot_value_function_grid(agent, agent_name, n_tasks, env, grid_size=100, out
 
         # Draw maze
         if draw_maze:
-            draw(env, ax)
+            draw(env, ax, maze_wall_style)
             for patch in ax.patches:
                 patch.set_zorder(3)
 
@@ -874,8 +878,9 @@ def plot_value_function_grid(agent, agent_name, n_tasks, env, grid_size=100, out
     fig.legend(handles, labels, loc='lower center', ncol=len(labels), bbox_to_anchor=(0.5, 0.02), frameon=False, markerscale=0.8)
 
     # Save figure
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1)
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1)
 
     # Convert to array
     fig.canvas.draw()

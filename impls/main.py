@@ -14,7 +14,7 @@ from agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset, DHPDataset
 from utils.env_utils import make_env_and_datasets
-from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video
+from utils.eval_utils import visualize_goal_buffer_on_maze, create_goal_trajectory_video, plot_value_function_grid
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
@@ -153,13 +153,14 @@ def main(_):
             renders = []
             eval_metrics = {}
             overall_metrics = defaultdict(list)
+            all_trajs = []
             render_trajs = []
             task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
             num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
             for task_id in tqdm.trange(1, num_tasks + 1):
                 task_name = task_infos[task_id - 1]['task_name']
                 eval_info, trajs, cur_renders, cur_render_trajs = evaluate(
-                    agent=eval_agent,
+                    policy=eval_agent.sample_actions,
                     env=env,
                     task_id=task_id,
                     config=config,
@@ -169,6 +170,7 @@ def main(_):
                     eval_temperature=FLAGS.eval_temperature,
                     eval_gaussian=FLAGS.eval_gaussian,
                 )
+                all_trajs.append(trajs)
                 renders.extend(cur_renders)
                 render_trajs.extend(cur_render_trajs)
                 metric_names = ['success']
@@ -180,6 +182,18 @@ def main(_):
                         overall_metrics[k].append(v)
             for k, v in overall_metrics.items():
                 eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
+
+            if hasattr(env.unwrapped, 'maze_map') and len(batch['observations'].shape) == 2:
+                val_image = plot_value_function_grid(
+                    agent=agent,
+                    agent_name = config['agent_name'],
+                    n_tasks=num_tasks,
+                    env=env,
+                    grid_size=100,
+                    output_path=os.path.join(FLAGS.save_dir, 'eval_value_func_image', f'step_{i}.png'),
+                    all_trajs=all_trajs[:10],
+                )
+                eval_metrics['value_image'] = wandb.Image(val_image)
 
             if FLAGS.video_episodes > 0:
                 if not FLAGS.debug:
