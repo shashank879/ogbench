@@ -6,13 +6,13 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-from utils.encoders import GCEncoder, encoder_modules
+from utils.encoders import GCEncoder, encoder_modules, GCSubEncoder
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize, RunningMeanStd
+from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize, RunningMeanStd, GCSubgoalCritic
 from utils.state_buffer import GoalBuffer
 
 
-class DHPBufferAgent(flax.struct.PyTreeNode):
+class DHPIQLAgent(flax.struct.PyTreeNode):
     """Discrete Hierarhical Planning (DHP) agent."""
 
     rng: Any
@@ -116,6 +116,34 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             'v_min': v.min(),
         }
 
+    def high_critic_loss(self, batch, grad_params):
+        state = batch['observations']
+        subgoal = batch['high_value_subgoals']
+        goal = batch['high_value_goals']
+        r_left = batch['rewards_left']
+        r_right = batch['rewards_right']
+        mask_left = batch['masks_left']
+        mask_right = batch['masks_right']
+        discount = self.config['high_discount']
+
+        left_next_v = self.network.select(self.config['high_act_val_fn'])(state, subgoal).min(0)
+        right_next_v = self.network.select(self.config['high_act_val_fn'])(subgoal, goal).min(0)
+        target_q = self.merge_op(
+            r_left + discount * mask_left * left_next_v,
+            r_right + discount * mask_right * right_next_v
+        )
+
+        q = self.network.select('high_critic')(state, goal, subgoals=subgoal, params=grad_params)
+
+        critic_loss = ((target_q[None] - q)**2).sum(0).mean()
+
+        return critic_loss, {
+            'critic_loss': critic_loss,
+            'q_mean': q.mean(),
+            'q_max': q.max(),
+            'q_min': q.min(),
+        }
+
     def low_actor_loss(self, batch, grad_params):
         """Compute the low-level actor loss."""
         v1, v2 = self.network.select('low_value')(batch['observations'], batch['low_actor_goals'])
@@ -163,18 +191,21 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
 
     def high_actor_loss(self, batch, grad_params):
         """Compute the high-level actor loss."""
-        v1, v2 = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals'])
-        nv1, nv2 = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals'])
-        v = (v1 + v2) / 2
-        nv = (nv1 + nv2) / 2
+
+        cur_state = batch['observations']
+        goal = batch['high_actor_goals']
+        subgoal = batch['high_actor_targets']
+
+        v = self.network.select(self.config['high_act_val_fn'])(cur_state, goal).mean(0)
+        nv = self.network.select(self.config['high_act_val_fn'])(subgoal, goal).mean(0)
         adv = nv - v
 
         exp_a = jnp.exp(adv * self.config['high_alpha'])
         exp_a = jnp.minimum(exp_a, 100.0)
 
-        dist = self.network.select('high_actor')(batch['observations'], batch['high_actor_goals'], params=grad_params)
-        target = self.network.select('goal_rep')(
-            jnp.concatenate([batch['observations'], batch['high_actor_targets']], axis=-1)
+        dist = self.network.select('high_actor')(cur_state, goal, params=grad_params)
+        target = self.network.select('subgoal_rep')(
+            jnp.concatenate([cur_state, goal, subgoal], axis=-1)
         )
         log_prob = dist.log_prob(target)
 
@@ -193,18 +224,23 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
 
     def high_actor_hierplan_loss(self, batch, grad_params):
         """Compute the high-level actor loss."""
-        v = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals']).mean(0)
-        left_nv = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_targets']).mean(0)
-        right_nv = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals']).mean(0)
+
+        cur_state = batch['observations']
+        goal = batch['high_actor_goals']
+        subgoal = batch['high_actor_targets']
+
+        v = self.network.select(self.config['high_act_val_fn'])(cur_state, goal).mean(0)
+        left_nv = self.network.select(self.config['high_act_val_fn'])(cur_state, subgoal).mean(0)
+        right_nv = self.network.select(self.config['high_act_val_fn'])(subgoal, goal).mean(0)
         nv = self.merge_op(left_nv, right_nv)
         adv = nv - v
 
         exp_a = jnp.exp(adv * self.config['high_alpha'])
         exp_a = jnp.minimum(exp_a, 100.0)
 
-        dist = self.network.select('high_actor')(batch['observations'], batch['high_actor_goals'], params=grad_params)
-        target = self.network.select('goal_rep')(
-            jnp.concatenate([batch['observations'], batch['high_actor_targets']], axis=-1)
+        dist = self.network.select('high_actor')(cur_state, goal, params=grad_params)
+        target = self.network.select('subgoal_rep')(
+            jnp.concatenate([cur_state, goal, subgoal], axis=-1)
         )
         log_prob = dist.log_prob(target)
 
@@ -227,42 +263,46 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         Decoder learns to invert the goal representation:
         goal_rep + emb_s -> emb_g
         """
+        state = batch['observations']
+        subgoal = batch['high_value_subgoals']
+        goal = batch['high_value_goals']
+
         if grad_params:
             grad_params = {'modules_goal_decoder': grad_params['modules_goal_decoder']}
         # Get state encoder from value function
         if self.config['encoder'] is not None:
             # Extract state embeddings using value function's encoder
-            emb_s = self.network.select('state_encoder')(batch['observations'])
-            emb_g_target = self.network.select('state_encoder')(batch['low_value_goals'])
+            ctx_emb = self.network.select('state_encoder')(state, goal)
+            target_emb = self.network.select('state_encoder')(subgoal)
         else:
             # State-based: use observations directly
-            emb_s = batch['observations']
-            emb_g_target = batch['low_value_goals']
+            ctx_emb = jnp.concat([state, goal], axis=-1)
+            target_emb = subgoal
 
         # Compute goal representations
-        goal_reps = self.network.select('goal_rep')(
-            jnp.concatenate([batch['observations'], batch['low_value_goals']], axis=-1)
+        goal_reps = self.network.select('subgoal_rep')(
+            jnp.concatenate([state, goal, subgoal], axis=-1)
         )
 
-        # Decode: [goal_rep; emb_s] -> emb_g
-        decoder_input = jax.lax.stop_gradient(jnp.concatenate([goal_reps, emb_s], axis=-1))
-        emb_g_decoded = self.network.select('goal_decoder')(decoder_input, params=grad_params)
+        # Decode: [subgoal_rep; emb_s] -> emb_g
+        decoder_input = jax.lax.stop_gradient(jnp.concatenate([ctx_emb, goal_reps], axis=-1))
+        decoder_out = self.network.select('goal_decoder')(decoder_input, params=grad_params)
 
         # Reconstruction loss in embedding space
         if self.config['decoder_inv_loss']:
             target_goal_reps = jax.lax.stop_gradient(goal_reps)
-            dec_goal_reps = self.network.select('goal_rep')(
-                jnp.concatenate([batch['observations'], emb_g_decoded], axis=-1)
+            dec_goal_reps = self.network.select('subgoal_rep')(
+                jnp.concatenate([state, goal, decoder_out], axis=-1)
             )
             reconstruction_loss = jnp.mean((target_goal_reps - dec_goal_reps) ** 2)
             cosine_sim = jnp.sum(dec_goal_reps * target_goal_reps, axis=-1) / (
                 jnp.linalg.norm(dec_goal_reps, axis=-1) * jnp.linalg.norm(target_goal_reps, axis=-1) + 1e-8
             )
         else:
-            emb_g_target = jax.lax.stop_gradient(emb_g_target)
-            reconstruction_loss = jnp.mean((emb_g_decoded - emb_g_target) ** 2)
-            cosine_sim = jnp.sum(emb_g_decoded * emb_g_target, axis=-1) / (
-                jnp.linalg.norm(emb_g_decoded, axis=-1) * jnp.linalg.norm(emb_g_target, axis=-1) + 1e-8
+            target_emb = jax.lax.stop_gradient(target_emb)
+            reconstruction_loss = jnp.mean((decoder_out - target_emb) ** 2)
+            cosine_sim = jnp.sum(decoder_out * target_emb, axis=-1) / (
+                jnp.linalg.norm(decoder_out, axis=-1) * jnp.linalg.norm(target_emb, axis=-1) + 1e-8
             )
 
         # Optional: cosine similarity loss for better direction matching
@@ -290,6 +330,10 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         for k, v in high_value_info.items():
             info[f'high_value/{k}'] = v
 
+        high_critic_loss, high_critic_info = self.high_critic_loss(batch, grad_params)
+        for k, v in high_critic_info.items():
+            info[f'high_critic/{k}'] = v
+
         low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params)
         for k, v in low_actor_info.items():
             info[f'low_actor/{k}'] = v
@@ -301,7 +345,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         for k, v in high_actor_info.items():
             info[f'high_actor/{k}'] = v
 
-        loss = low_value_loss + high_value_loss + low_actor_loss + high_actor_loss
+        loss = low_value_loss + high_value_loss + low_actor_loss + high_actor_loss + high_critic_loss
 
         # Add decoder loss if enabled
         if self.config['use_goal_decoder']:
@@ -399,7 +443,16 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         goal_reps = high_dist.sample(seed=high_seed)
         goal_reps = goal_reps / jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) * jnp.sqrt(goal_reps.shape[-1])
 
-        low_dist = self.network.select('low_actor')(observations, goal_reps, goal_encoded=True, temperature=temperature)
+        # Retrieve nearest goal from buffer
+        retrieved_goal = self.goal_buffer.retrieve_nearest_embedding(
+            goal_emb_query=None,
+            goal_rep_query=goal_reps,
+            current_state=jnp.concat([observations, goals], axis=-1),
+            goal_rep_fn=lambda s,g: self.network.select('subgoal_rep')(
+                jnp.concatenate([s, g], axis=-1),
+            ),
+        )
+        low_dist = self.network.select('low_actor')(observations, retrieved_goal, goal_encoded=False, temperature=temperature)
         actions = low_dist.sample(seed=low_seed)
 
         if not self.config['discrete']:
@@ -434,8 +487,8 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             retrieved_goal = self.goal_buffer.retrieve_nearest_embedding(
                 goal_emb_query=None,
                 goal_rep_query=goal_reps,
-                current_state=observations,
-                goal_rep_fn=lambda s,g: self.network.select('goal_rep')(
+                current_state=jnp.concat([observations, goals], axis=-1),
+                goal_rep_fn=lambda s,g: self.network.select('subgoal_rep')(
                     jnp.concatenate([s, g], axis=-1),
                 ),
             )
@@ -477,16 +530,19 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         if self.config['use_goal_decoder']:
             # Get current state embedding from value function's encoder
             if self.config['encoder'] is not None:
-                emb_s = self.network.select('state_encoder')(observations)
+                ctx_emb = self.network.select('state_encoder')(observations, goals)
             else:
-                emb_s = observations
-            decoder_input = jnp.concatenate([subgoal_reps, jnp.broadcast_to(emb_s[None], (subgoal_reps.shape[0], *emb_s.shape))], axis=-1)
+                ctx_emb = jnp.concat([observations, goals], axis=-1)
+            decoder_input = jnp.concatenate([
+                    jnp.broadcast_to(ctx_emb[None], (subgoal_reps.shape[0], *ctx_emb.shape)),
+                    subgoal_reps
+                ], axis=-1)
             emb_g_decoded = self.network.select('goal_decoder')(decoder_input)
             # Add visual decoder here to support visual decoded subgoals
             dec_goal_emb = jnp.concatenate([goals[None], emb_g_decoded], axis=0)  # Shape: (depth+1, obs_dim)
             info['decoded_subgoals'] = dec_goal_emb
 
-        low_dist = self.network.select('low_actor')(observations, first_subgoal, temperature=temperature)
+        low_dist = self.network.select('low_actor')(observations, first_subgoal, goal_encoded=False, temperature=temperature)
         actions = low_dist.sample(seed=low_seed)
 
         if not self.config['discrete']:
@@ -518,42 +574,31 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         else:
             action_dim = ex_actions.shape[-1]
 
+        encoder_module = encoder_modules[config['encoder']] if config['encoder'] is not None else Identity
+
         # Define (state-dependent) subgoal representation phi([s; g]) that outputs a length-normalized vector.
-        if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            goal_rep_seq = [encoder_module()]
-        else:
-            goal_rep_seq = []
-        goal_rep_seq.append(
+        goal_rep_seq = [
+            encoder_module(),
             MLP(
                 hidden_dims=(*config['value_hidden_dims'], config['rep_dim']),
                 activate_final=False,
                 layer_norm=config['layer_norm'],
-            )
-        )
-        goal_rep_seq.append(LengthNormalize())
+            ),
+            LengthNormalize(),
+        ]
         goal_rep_def = nn.Sequential(goal_rep_seq)
 
-        # Define goal decoder: [goal_rep; emb_s] -> emb_g
-        if config['use_goal_decoder']:
-            assert config['encoder'] is None, 'Presently decoder is not supported with pixel obs'
-            if config['encoder'] is not None:
-                # For pixel-based: need to determine encoder output dimension
-                encoder_output_dim = goal_rep_seq[0].mlp_hidden_dims[-1]
-            else:
-                # For state-based: embedding dimension = observation dimension
-                # encoder_output_dim = ex_observations.shape[-1]
-                encoder_output_dim = ex_observations.shape[-1]
-
-            decoder_input_dim = config['rep_dim'] + encoder_output_dim
-            goal_decoder_def = MLP(
-                hidden_dims=(*config['value_hidden_dims'], encoder_output_dim),
+        # \psi(s, subgoal, g)
+        subgoal_rep_seq = [
+            encoder_module(),
+            MLP(
+                hidden_dims=(*config['value_hidden_dims'], config['subgoal_rep_dim']),
                 activate_final=False,
                 layer_norm=config['layer_norm'],
-            )
-        else:
-            goal_decoder_def = None
-            decoder_input_dim = None
+            ),
+            LengthNormalize(),
+        ]
+        subgoal_rep_def = nn.Sequential(subgoal_rep_seq)
 
         # Define the encoders that handle the inputs to the value and actor networks.
         # The subgoal representation phi([s; g]) is trained by the parameterized value function V(s, phi([s; g])).
@@ -569,6 +614,8 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             # High Value: V^h(encoder^Vh([s; g]))
             high_value_encoder_def = GCEncoder(concat_encoder=encoder_module())
             target_high_value_encoder_def = GCEncoder(concat_encoder=encoder_module())
+            # High Critic: Q^h(encoder^Qh([s; g]), \psi(s, subgoal, g))
+            high_critic_encoder_def = GCSubEncoder(state_encoder=encoder_module(), concat_encoder=subgoal_rep_def)
             # Low-level actor: pi^l(. | encoder^l(s), phi([s; w]))
             low_actor_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
             # High-level actor: pi^h(. | encoder^h([s; g]))
@@ -582,6 +629,8 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             # High Value: V^h([s; g])
             high_value_encoder_def = None
             target_high_value_encoder_def = None
+            # High Critic: Q^h([s; subgoal; g])
+            high_critic_encoder_def = GCSubEncoder(state_encoder=Identity(), concat_encoder=subgoal_rep_def)
             # Low-level actor: pi^l(. | s, phi([s; w]))
             low_actor_encoder_def = GCEncoder(state_encoder=Identity(), concat_encoder=goal_rep_def)
             # High-level actor: pi^h(. | s, g) (i.e., no encoder)
@@ -614,6 +663,13 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             gc_encoder=target_high_value_encoder_def,
         )
 
+        high_critic_def = GCSubgoalCritic(
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            ensemble=True,
+            gc_encoder=high_critic_encoder_def,
+        )
+
         if config['discrete']:
             low_actor_def = GCDiscreteActor(
                 hidden_dims=config['actor_hidden_dims'],
@@ -639,16 +695,33 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
 
         network_info = dict(
             goal_rep=(goal_rep_def, (jnp.concatenate([ex_observations, ex_goals], axis=-1))),
+            subgoal_rep=(subgoal_rep_def, (jnp.concatenate([ex_observations, ex_observations, ex_goals], axis=-1))),
             low_value=(low_value_def, (ex_observations, ex_goals)),
             target_low_value=(target_low_value_def, (ex_observations, ex_goals)),
             high_value=(high_value_def, (ex_observations, ex_goals)),
             target_high_value=(target_high_value_def, (ex_observations, ex_goals)),
+            high_critic=(high_critic_def, (ex_observations, ex_observations, ex_observations)),
             low_actor=(low_actor_def, (ex_observations, ex_goals)),
             high_actor=(high_actor_def, (ex_observations, ex_goals)),
         )
 
-        # Add decoder if enabled
+        # Define goal decoder: [goal_rep; emb_s] -> emb_g
         if config['use_goal_decoder']:
+            assert config['encoder'] is None, 'Presently decoder is not supported with pixel obs'
+            if config['encoder'] is not None:
+                # For pixel-based: need to determine encoder output dimension
+                encoder_output_dim = goal_rep_seq[0].mlp_hidden_dims[-1]
+            else:
+                # For state-based: embedding dimension = observation dimension
+                # encoder_output_dim = ex_observations.shape[-1]
+                encoder_output_dim = ex_observations.shape[-1]
+
+            decoder_input_dim = config['rep_dim'] + 2 * encoder_output_dim
+            goal_decoder_def = MLP(
+                hidden_dims=(*config['value_hidden_dims'], encoder_output_dim),
+                activate_final=False,
+                layer_norm=config['layer_norm'],
+            )
             ex_dec_input = jnp.zeros((1, decoder_input_dim))
             network_info['goal_decoder'] = (goal_decoder_def, (ex_dec_input,))
             network_info['state_encoder'] = (low_value_encoder_def.state_encoder, (ex_observations,))
@@ -678,7 +751,7 @@ def get_config():
     config = ml_collections.ConfigDict(
         dict(
             # Agent hyperparameters.
-            agent_name='dhpbuff',  # Agent name.
+            agent_name='dhpiql',  # Agent name.
             lr=3e-4,  # Learning rate.
             batch_size=1024,  # Batch size.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
@@ -692,6 +765,7 @@ def get_config():
             high_alpha=3.0,  # High-level AWR temperature.
             subgoal_steps=25,  # Subgoal steps.
             rep_dim=10,  # Goal representation dimension.
+            subgoal_rep_dim=10,
             low_actor_rep_grad=False,  # Whether low-actor gradients flow to goal representation (use True for pixels).
             const_std=True,  # Whether to use constant standard deviation for the actors.
             discrete=False,  # Whether the action space is discrete.

@@ -8,6 +8,7 @@ from agents.sac import SACAgent
 from agents.dhp_1value import DHPv1Agent
 from agents.dhp_2value import DHPv2Agent
 from agents.dhp_buff import DHPBufferAgent
+from agents.dhp_iql import DHPIQLAgent
 from agents.dhp import DHPAgent
 from agents.dhp_expl import DHPExplAgent
 
@@ -22,6 +23,7 @@ agents = dict(
     dhpv1=DHPv1Agent,
     dhpv2=DHPv2Agent,
     dhpbuff=DHPBufferAgent,
+    dhpiql=DHPIQLAgent,
     dhp=DHPAgent,
     dhpexpl=DHPExplAgent,
 )
