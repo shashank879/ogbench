@@ -139,6 +139,45 @@ class GCEncoder(nn.Module):
         return reps
 
 
+class GCSubEncoder(nn.Module):
+    """Helper module to handle inputs to goal-conditioned networks.
+
+    It takes in observations (s) and goals (g) and returns the concatenation of `state_encoder(s)`, `goal_encoder(g)`,
+    and `concat_encoder([s, g])`. It ignores the encoders that are not provided. This way, the module can handle both
+    early and late fusion (or their variants) of state and goal information.
+    """
+
+    state_encoder: nn.Module = None
+    subgoal_encoder: nn.Module = None
+    concat_encoder: nn.Module = None
+
+    @nn.compact
+    def __call__(self, observations, goals=None, subgoals=None, obs_encoded=False, goal_encoded=False, subgoal_encoded=False):
+        """Returns the representations of observations and goals.
+
+        If `goal_encoded` is True, `goals` is assumed to be already encoded representations. In this case, either
+        `goal_encoder` or `concat_encoder` must be None.
+        """
+        reps = []
+        if self.state_encoder is not None:
+            if obs_encoded:
+                reps.append(observations)
+                reps.append(goals)
+            else:
+                reps.append(self.state_encoder(
+                    jnp.concatenate([observations, goals], axis=-1)))
+        if subgoal_encoded:
+            reps.append(subgoals)
+        else:
+            # Can't have both goal_encoder and concat_encoder in this case.
+            assert self.subgoal_encoder is None or self.concat_encoder is None
+            if self.subgoal_encoder is not None:
+                reps.append(self.subgoal_encoder(subgoals))
+            if self.concat_encoder is not None:
+                reps.append(self.concat_encoder(jnp.concatenate([observations, goals, subgoals], axis=-1)))
+        reps = jnp.concatenate(reps, axis=-1)
+        return reps
+
 encoder_modules = {
     'impala': ImpalaEncoder,
     'impala_debug': functools.partial(ImpalaEncoder, num_blocks=1, stack_sizes=(4, 4)),
