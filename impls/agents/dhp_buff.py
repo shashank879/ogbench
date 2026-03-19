@@ -446,7 +446,11 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         )
 
         subgoals = jnp.concatenate([goals[None], subgoals], axis=0)  # Shape: (depth+1, obs_dim)
-        low_value_pred = self.network.select('low_value')(jnp.stack([observations] * subgoals.shape[0], 0), subgoals).mean(0)  # Shape: (depth+1,)
+        goal_rep = self.network.select('goal_rep')(
+            jnp.concatenate([observations, goals], axis=-1),
+        )
+        subgoal_reps = jnp.concatenate([goal_rep[None], subgoal_reps], axis=0)  # Shape: (depth+1, rep_dim)
+        low_value_pred = self.network.select('low_value')(jnp.stack([observations] * subgoals.shape[0], 0), subgoal_reps, goal_encoded=True).mean(0)  # Shape: (depth+1,)
         reachable = self.low_actor_val_norm.normalize(low_value_pred) >= self.config['reachable_thresh_val']
         cont = jax.lax.cumprod(1 - reachable, axis=0)  # Shape: (depth+1,)
 
@@ -459,7 +463,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         first_reach_index = jnp.argmax(first_reach, axis=0)  # Scalar
 
         # Extract first reachable subgoal using weighted sum
-        first_subgoal = jnp.sum(jnp.expand_dims(first_reach, [i+1 for i in range(len(subgoals.shape) - len(first_reach.shape))]) * subgoals, axis=0)
+        first_subgoal_rep = (jnp.expand_dims(first_reach, [i+1 for i in range(len(subgoals.shape) - len(first_reach.shape))]) * subgoal_reps).sum(0)
 
         info['subgoals'] = subgoals
         info['subgoal_first_reach_index'] = first_reach_index
@@ -477,7 +481,7 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
             dec_goal_emb = jnp.concatenate([goals[None], emb_g_decoded], axis=0)  # Shape: (depth+1, obs_dim)
             info['decoded_subgoals'] = dec_goal_emb
 
-        low_dist = self.network.select('low_actor')(observations, first_subgoal, temperature=temperature)
+        low_dist = self.network.select('low_actor')(observations, first_subgoal_rep, goal_encoded=True, temperature=temperature)
         actions = low_dist.sample(seed=low_seed)
 
         if not self.config['discrete']:
