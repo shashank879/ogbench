@@ -45,28 +45,32 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         compute the former and the current value function to compute the latter. This is similar to how double DQN
         mitigates overestimation bias.
         """
-        (next_v1_t, next_v2_t) = self.network.select('target_low_value')(batch['next_observations'], batch['low_value_goals'])
-        next_v_t = jnp.minimum(next_v1_t, next_v2_t)
-        q = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v_t
+        next_v1_ts = self.network.select('target_low_value')(batch['next_observations'], batch['low_value_goals'])
+        next_v_t = next_v1_ts.min(0)
+        q_min = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v_t
 
-        (v1_t, v2_t) = self.network.select('target_low_value')(batch['observations'], batch['low_value_goals'])
-        v_t = (v1_t + v2_t) / 2
-        adv = q - v_t
+        v1_ts = self.network.select('target_low_value')(batch['observations'], batch['low_value_goals'])
+        v_t = v1_ts.mean(0)
+        adv = q_min - v_t
 
-        q1 = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v1_t
-        q2 = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v2_t
-        (v1, v2) = self.network.select('low_value')(batch['observations'], batch['low_value_goals'], params=grad_params)
-        v = (v1 + v2) / 2
+        qs = batch['low_rewards'] + self.config['discount'] * batch['low_masks'] * next_v1_ts
+        vs = self.network.select('low_value')(batch['observations'], batch['low_value_goals'], params=grad_params)
+        v = vs.mean(0)
 
-        value_loss1 = self.expectile_loss(adv, q1 - v1, self.config['expectile']).mean()
-        value_loss2 = self.expectile_loss(adv, q2 - v2, self.config['expectile']).mean()
-        value_loss = value_loss1 + value_loss2
+        value_losses = self.expectile_loss(adv, qs - vs, self.config['expectile']).mean()
+        value_loss = value_losses.sum(0).mean()
 
         return value_loss, {
             'value_loss': value_loss,
             'v_mean': v.mean(),
             'v_max': v.max(),
             'v_min': v.min(),
+            'q_mean': q_min.mean(),  # Monitor if Targets are inflating
+            'q_max': q_min.max(),
+            'v_diff_mean': (q_min - v).mean(),  # Is V catching up to Q?
+            'adv_mean': adv.mean(),  # Should be close to 0
+            'adv_std': adv.std(),  # If this shrinks, signal is lost
+            'pos_adv_pct': (adv > 0).astype(jnp.float32).mean(),  # HEALTH CHECK: Should be > 0 and < 1
         }
 
     def high_value_loss(self, batch, grad_params):
@@ -78,30 +82,27 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
         compute the former and the current value function to compute the latter. This is similar to how double DQN
         mitigates overestimation bias.
         """
-        (left_next_v1_t, left_next_v2_t) = self.network.select('target_high_value')(batch['observations'], batch['high_value_subgoals'])
-        (right_next_v1_t, right_next_v2_t) = self.network.select('target_high_value')(batch['high_value_subgoals'], batch['high_value_goals'])
-        left_next_v_t = jnp.minimum(left_next_v1_t, left_next_v2_t)
-        right_next_v_t = jnp.minimum(right_next_v1_t, right_next_v2_t)
+        left_next_v_ts = self.network.select('target_high_value')(batch['observations'], batch['high_value_subgoals'])
+        right_next_v_ts = self.network.select('target_high_value')(batch['high_value_subgoals'], batch['high_value_goals'])
+        left_next_v_t = left_next_v_ts.min(0)
+        right_next_v_t = right_next_v_ts.min(0)
         q = self.merge_op(
             batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v_t,
             batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v_t)
 
-        (v1_t, v2_t) = self.network.select('target_high_value')(batch['observations'], batch['high_value_goals'])
-        v_t = (v1_t + v2_t) / 2
+        v_ts = self.network.select('target_high_value')(batch['observations'], batch['high_value_goals'])
+        v_t = v_ts.mean(0)
         adv = q - v_t
 
-        q1 = self.merge_op(
-            batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v1_t,
-            batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v1_t)
-        q2 = self.merge_op(
-            batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v2_t,
-            batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v2_t)
-        (v1, v2) = self.network.select('high_value')(batch['observations'], batch['high_value_goals'], params=grad_params)
-        v = (v1 + v2) / 2
+        left_qs = batch['rewards_left'] + self.config['high_discount'] * batch['masks_left'] * left_next_v_ts
+        right_qs = batch['rewards_right'] + self.config['high_discount'] * batch['masks_right'] * right_next_v_ts
+        qs = self.merge_op(left_qs, right_qs)
 
-        value_loss1 = self.expectile_loss(adv, q1 - v1, self.config['expectile']).mean()
-        value_loss2 = self.expectile_loss(adv, q2 - v2, self.config['expectile']).mean()
-        value_loss = value_loss1 + value_loss2
+        vs = self.network.select('high_value')(batch['observations'], batch['high_value_goals'], params=grad_params)
+        v = vs.mean(0)
+
+        value_losses = self.expectile_loss(adv, qs - vs, self.config['expectile']).sum(0)
+        value_loss = value_losses.mean()
 
         return value_loss, {
             'value_loss': value_loss,
@@ -112,10 +113,8 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
 
     def low_actor_loss(self, batch, grad_params):
         """Compute the low-level actor loss."""
-        v1, v2 = self.network.select('low_value')(batch['observations'], batch['low_actor_goals'])
-        nv1, nv2 = self.network.select('low_value')(batch['next_observations'], batch['low_actor_goals'])
-        v = (v1 + v2) / 2
-        nv = (nv1 + nv2) / 2
+        v = self.network.select('low_value')(batch['observations'], batch['low_actor_goals']).mean(0)
+        nv = self.network.select('low_value')(batch['next_observations'], batch['low_actor_goals']).mean(0)
         adv = nv - v
 
         exp_a = jnp.exp(adv * self.config['low_alpha'])
@@ -157,10 +156,8 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
 
     def high_actor_loss(self, batch, grad_params):
         """Compute the high-level actor loss."""
-        v1, v2 = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals'])
-        nv1, nv2 = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals'])
-        v = (v1 + v2) / 2
-        nv = (nv1 + nv2) / 2
+        v = self.network.select(self.config['high_act_val_fn'])(batch['observations'], batch['high_actor_goals']).mean(0)
+        nv = self.network.select(self.config['high_act_val_fn'])(batch['high_actor_targets'], batch['high_actor_goals']).mean(0)
         adv = nv - v
 
         exp_a = jnp.exp(adv * self.config['high_alpha'])
