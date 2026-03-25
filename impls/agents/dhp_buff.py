@@ -21,6 +21,18 @@ class DHPBufferAgent(flax.struct.PyTreeNode):
     low_actor_val_norm: RunningMeanStd
     config: Any = nonpytree_field()
 
+    def save_state(self):
+        return dict(
+            agent=flax.serialization.to_state_dict(self),
+            goal_buffer=self.goal_buffer.save_state(),
+        )
+
+    def load_state(self, load_dict):
+        agent = flax.serialization.from_state_dict(self, load_dict['agent'])
+        if 'goal_buffer' in load_dict:
+            agent.goal_buffer.load_state(load_dict['goal_buffer'])
+        return agent
+
     @staticmethod
     def expectile_loss(adv, diff, expectile):
         """Compute the expectile loss."""

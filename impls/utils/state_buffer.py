@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing import List, Optional
 
 
@@ -11,6 +12,21 @@ class GoalBuffer:
         self.reference_state = reference_state  # Fixed reference
         self.goal_embeddings = []  # List of goal embeddings (emb_g)
         self.goal_observations = []  # List of actual goal observations
+
+    def save_state(self):
+        return dict(
+            capacity=self.capacity,
+            reference_state=self.reference_state,
+            goal_observations=[np.asarray(o) for o in self.goal_observations],
+            goal_embeddings=[np.asarray(e) for e in self.goal_embeddings],
+        )
+
+    def load_state(self, load_dict):
+        self.capacity = load_dict['capacity']
+        self.reference_state = jnp.asarray(load_dict['reference_state'])
+        self.goal_observations = [jnp.asarray(o) for o in load_dict['goal_observations']]
+        self.goal_embeddings = [jnp.asarray(e) for e in load_dict['goal_embeddings']]
+        return self
 
     def is_full(self):
         return len(self.goal_observations) >= self.capacity

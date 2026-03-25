@@ -168,9 +168,13 @@ def save_agent(agent, save_dir, epoch):
         epoch: Epoch number.
     """
 
-    save_dict = dict(
-        agent=flax.serialization.to_state_dict(agent),
-    )
+    if hasattr(agent, 'save_state'):
+        save_dict = agent.save_state()
+    else:
+        save_dict = dict(
+            agent=flax.serialization.to_state_dict(agent),
+        )
+
     save_path = os.path.join(save_dir, f'params_{epoch}.pkl')
     with open(save_path, 'wb') as f:
         pickle.dump(save_dict, f)
@@ -195,7 +199,10 @@ def restore_agent(agent, restore_path, restore_epoch):
     with open(restore_path, 'rb') as f:
         load_dict = pickle.load(f)
 
-    agent = flax.serialization.from_state_dict(agent, load_dict['agent'])
+    if hasattr(agent, 'load_state'):
+        agent = agent.load_state(load_dict)
+    else:
+        agent = flax.serialization.from_state_dict(agent, load_dict['agent'])
 
     print(f'Restored from {restore_path}')
 
