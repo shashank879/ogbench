@@ -117,7 +117,7 @@ def download_datasets(dataset_names, dataset_dir=DEFAULT_DATASET_DIR):
 
 def make_env_and_datasets(
     dataset_name,
-    dataset_dir=DEFAULT_DATASET_DIR,
+    dataset_dir=None,
     compact_dataset=False,
     env_only=False,
     **env_kwargs,
@@ -141,7 +141,7 @@ def make_env_and_datasets(
         return env
 
     # Load datasets.
-    dataset_dir = os.path.expanduser(dataset_dir)
+    dataset_dir = os.path.expanduser(dataset_dir or DEFAULT_DATASET_DIR)
     download_datasets([dataset_name], dataset_dir)
     train_dataset_path = os.path.join(dataset_dir, f'{dataset_name}.npz')
     val_dataset_path = os.path.join(dataset_dir, f'{dataset_name}-val.npz')
