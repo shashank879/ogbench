@@ -88,6 +88,10 @@ def setup_wandb(
 
     run = wandb.init(**init_kwargs)
 
+    def exclude_fn(path, root):
+        return os.path.relpath(path).startswith('exp/')
+    run.log_code('../impls', exclude_fn=exclude_fn)
+
     return run
 
 
